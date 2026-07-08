@@ -1,0 +1,1 @@
+/usr/bin/cc -Wl,--dependency-file=CMakeFiles/ips_loader.dir/link.d CMakeFiles/ips_loader.dir/main.c.o -o ips_loader  -lbpf -lelf -lz
