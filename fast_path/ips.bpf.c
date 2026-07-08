@@ -6,6 +6,13 @@
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86DD
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH); // The type of map
+    __type(key, __u32);              // The Key: A 32-bit integer (IPv4 address)
+    __type(value, __u32);            // The Value: A 32-bit integer (Packet count)
+    __uint(max_entries, 10240);      // Max IPs to track before the map is full
+} ip_tracker SEC(".maps");           // The name of our map and its special memory section
+
 SEC("xdp")
 int fast_path_parser(struct xdp_md *ctx) {
     // 1. Get the raw memory pointers
@@ -67,6 +74,27 @@ int fast_path_parser(struct xdp_md *ctx) {
         bpf_printk("[TCP] %pI4:%d -> %pI4:%d\n",
                    &ip->saddr, bpf_ntohs(tcp->source),
                    &ip->daddr, bpf_ntohs(tcp->dest));
+
+        // 1. Grab the source IP from the packet
+        __u32 src_ip = ip->saddr;
+
+        // 2. Look up the IP in our Hash Map
+        __u32 *packet_count;
+        packet_count = bpf_map_lookup_elem(&ip_tracker, &src_ip);
+
+        if (packet_count) {
+            // 3a. The IP exists! Increment the counter safely.
+            __sync_fetch_and_add(packet_count, 1);
+
+            // Optional: Print a warning if they cross a threshold
+            if (*packet_count > 100) {
+                bpf_printk("WARNING: IP %pI4 crossed 100 packets!\n", &src_ip);
+            }
+        } else {
+            // 3b. First time seeing this IP. Add it to the map with a count of 1.
+            __u32 initial_count = 1;
+            bpf_map_update_elem(&ip_tracker, &src_ip, &initial_count, BPF_ANY);
+        }
 
     } else if (ip->protocol == IPPROTO_UDP) {
         // The UDP header starts exactly where the IP header ends
