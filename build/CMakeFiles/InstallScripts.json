@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/raul/Intrusion-Prevention-System/build/cmake_install.cmake",
+		"/home/raul/Intrusion-Prevention-System/build/fast_path/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

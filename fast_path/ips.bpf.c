@@ -8,7 +8,7 @@
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86DD
 
-#define MAX_PPS 10000
+#define MAX_PPS 5
 #define ONE_SECOND_NS 1000000000ULL // Define 1 second in nanoseconds (1 billion)
 
 //----------------------------------------------------------------------------------------------------------------------
