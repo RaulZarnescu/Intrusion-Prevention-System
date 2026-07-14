@@ -1,0 +1,16 @@
+# CLion / JetBrains IDE files
+.idea/
+
+# CMake build directories
+build/
+cmake-build-*/
+cmake-build-debug/
+
+# Compiled object files
+*.o
+
+# eBPF generated skeleton headers
+*.skel.h
+
+# Compiled executables (add specific names if you have them, e.g., ips_app)
+*.out

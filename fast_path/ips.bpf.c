@@ -12,11 +12,17 @@
 #define ONE_SECOND_NS 1000000000ULL // Define 1 second in nanoseconds (1 billion)
 
 //----------------------------------------------------------------------------------------------------------------------
-
+// ==============================================================================
+// #REQ-010: Rate Limit Packets per Second
+// ==============================================================================
 struct rate_limit_data {
     __u64 timestamp; // The start of the 1-second window (in nanoseconds)
     __u32 count;     // How many packets seen in this window
 };
+
+// ==============================================================================
+// Hash Map Pachet
+// ==============================================================================
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);                 // The type of map
@@ -24,6 +30,36 @@ struct {
     __type(value, struct rate_limit_data);           // The Value: Our rate limit structure
     __uint(max_entries, 10240);                      // Max IPs to track before the map is full
 } ip_tracker SEC(".maps") ;                          // The name of our map and its special memory section
+
+// ==============================================================================
+// #REQ-009 & #REQ-057: Static/Dynamic Blocklist Map
+// ==============================================================================
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u32);   // Key: Source IPv4 Address
+    __type(value, __u8);  // Value: Just a boolean flag (1 = Blocked)
+    __uint(max_entries, 65536); // Can hold 65k known malicious IPs
+} blocklist SEC(".maps");
+
+// ==============================================================================
+// #REQ-024: Honeypot Redirect Map
+// ==============================================================================
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u32);   // Key: Source IPv4 Address
+    __type(value, __u8);  // Value: Boolean flag (1 = Redirect to Honeypot)
+    __uint(max_entries, 10240);
+} honeypot_map SEC(".maps");
+
+// ==============================================================================
+// #REQ-007: Dynamic Flow Offload (Allowlist)
+// ==============================================================================
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH); // Auto-evicts old entries to save memory
+    __type(key, __u32);   // Key: Source IPv4 Address
+    __type(value, __u8);  // Value: Boolean flag (1 = Trusted Flow)
+    __uint(max_entries, 131072); // Can track ~131k simultaneous trusted connections
+} allowlist SEC(".maps");
 
 //----------------------------------------------------------------------------------------------------------------------
 
@@ -59,19 +95,19 @@ int fast_path_parser(struct xdp_md *ctx) {
 
     // Grab the source IP from the packet immediately for Rate Limiting
     __u32 src_ip = ip->saddr;
-
+    __u8 *action_flag;
     // ----------------------------------------------------
+    // PIPELINE STAGE 1
     // #REQ-010: Rate Limiting per-source (PPS)
     // Evaluated first before any deep parsing/logs
     // ----------------------------------------------------
     __u64 current_time = bpf_ktime_get_ns();
     struct rate_limit_data *rl_data;
 
-    // FIX: Assigned correctly to rl_data, not "data"
     rl_data = bpf_map_lookup_elem(&ip_tracker, &src_ip);
 
     if (rl_data) {
-        // IP exists! Check the time window
+        // If exists, Check the time window
         __u64 time_diff = current_time - rl_data->timestamp;
 
         if (time_diff > ONE_SECOND_NS) {
@@ -89,13 +125,48 @@ int fast_path_parser(struct xdp_md *ctx) {
             }
         }
     } else {
-        // First time seeing this IP. Initialize the struct and add to map.
+        //  Initialize the struct and add to map.
         struct rate_limit_data new_data = {};
         new_data.timestamp = current_time;
         new_data.count = 1;
 
         bpf_map_update_elem(&ip_tracker, &src_ip, &new_data, BPF_ANY);
     }
+    // ----------------------------------------------------
+    // PIPELINE STAGE 2: Blocklist (#REQ-009)
+    // ----------------------------------------------------
+
+    action_flag = bpf_map_lookup_elem(&blocklist, &src_ip);
+    if (action_flag && *action_flag == 1) {
+        // bpf_printk("BLOCKLIST: Dropping known threat %pI4\n", &src_ip);
+        return XDP_DROP;
+    }
+
+    // ----------------------------------------------------
+    // PIPELINE STAGE 3: Marcaj Honeypot (#REQ-024)
+    // ----------------------------------------------------
+    action_flag = bpf_map_lookup_elem(&honeypot_map, &src_ip);
+    if (action_flag && *action_flag == 1) {
+        // bpf_printk("HONEYPOT: Redirecting attacker %pI4\n", &src_ip);
+        // TODO: Implement actual MAC/IP manipulation for DNAT here later
+        return XDP_PASS; // (Temporary PASS until we write the DNAT logic)
+    }
+
+    // ----------------------------------------------------
+    // PIPELINE STAGE 4: Dynamic Flow Offload / Allowlist (#REQ-007)
+    // ----------------------------------------------------
+    action_flag = bpf_map_lookup_elem(&allowlist, &src_ip);
+    if (action_flag && *action_flag == 1) {
+        // Traffic is known and trusted by the Slow-Path.
+        return XDP_PASS;
+    }
+
+    // ----------------------------------------------------
+    // PIPELINE STAGE 5: Implicit PASS (To Slow-Path)
+    // ----------------------------------------------------
+    // If it survived the rate limiter, isn't blocked, isn't a honeypot target,
+    // and isn't offloaded yet, it gets passed to the OS/Slow-Path for L7 inspection.
+
 
     // ----------------------------------------------------
     // LAYER 4: TCP / UDP Headers
@@ -114,7 +185,6 @@ int fast_path_parser(struct xdp_md *ctx) {
     }
 
     if (ip->protocol == IPPROTO_TCP) {
-        // FIX: Safe pointer arithmetic casting
         struct tcphdr *tcp = (void *)((__u8 *)ip + ip_hdr_len);
 
         // BOUNDS CHECK: Is there enough data for the TCP header?
