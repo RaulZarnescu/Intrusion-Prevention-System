@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
 #include <time.h>
+#include <net/if.h>
 
 #include "ips_fast_common.h"
 
@@ -17,15 +18,32 @@ int main(int argc, char **argv) {
     struct ips_bpf *skel;
     int err;
 
-    // IMPORTANT: Change "eth0" to your VM's actual network interface!
-    // Open a terminal in your VM and type `ip a` to find the name.
+    // ----------------------------------------------------------------
+    // AUTO-DETECT NETWORK INTERFACE & ATTACH
+    // ----------------------------------------------------------------
+    int ifindex = 0;
+    const char *iface_name = NULL;
 
-    const char *iface = "enp2s0";
+    // Try native Linux interface
+    if ((ifindex = if_nametoindex("enp2s0")) > 0) {
+        iface_name = "enp2s0";
+    } 
+    // Try Oracle VM interface
+    else if ((ifindex = if_nametoindex("enp0s3")) > 0) {
+        iface_name = "enp0s3";
+    }
 
-    // Convert the string name (e.g., "eth0") to the kernel's internal interface index
-    int ifindex = if_nametoindex(iface);
-    if (!ifindex) {
-        fprintf(stderr, "Failed to find interface %s\n", iface);
+    if (ifindex <= 0) {
+        fprintf(stderr, "[!] Error: No known network interfaces found!\n");
+        return 1;
+    }
+
+    printf("[i] Using interface %s (Index: %d)\n", iface_name, ifindex);
+
+    // Attach the XDP program to the detected interface
+    struct bpf_link *link = bpf_program__attach_xdp(skel->progs.fast_path_parser, ifindex);
+    if (!link) {
+        fprintf(stderr, "[!] Failed to attach XDP program to %s\n", iface_name);
         return 1;
     }
 
