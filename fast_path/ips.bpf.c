@@ -85,8 +85,23 @@ int fast_path_parser(struct xdp_md *ctx) {
 
     // ----------------------------------------------------
     // PIPELINE STAGE 1
+    // Blocklist (#REQ-009)
+    // After testing, decided to set it first due to writing overhead caused by incrementing pachet drops on already banned ip's
+    // ----------------------------------------------------
+
+    struct ips_blocklist_data *block_data;
+    block_data = bpf_map_lookup_elem(&blocklist, &src_ip);
+
+    if (block_data) {
+        // If the lookup doesn't return NULL, the IP is in the map.
+        // We don't even need to check the timestamp here in the kernel.
+        // If it's in the map, it's banned. The user-space handles the aging!
+        return XDP_DROP;
+    }
+
+    // ----------------------------------------------------
+    // PIPELINE STAGE 2
     // #REQ-010: Rate Limiting per-source (PPS)
-    // Evaluated first before any deep parsing/logs
     // ----------------------------------------------------
 
     __u64 current_time = bpf_ktime_get_ns();
@@ -122,19 +137,6 @@ int fast_path_parser(struct xdp_md *ctx) {
             __sync_fetch_and_add(&bucket->drop_count, 1);
             return XDP_DROP;
         }
-    }
-    // ----------------------------------------------------
-    // PIPELINE STAGE 2: Blocklist (#REQ-009)
-    // ----------------------------------------------------
-
-    struct ips_blocklist_data *block_data;
-    block_data = bpf_map_lookup_elem(&blocklist, &src_ip);
-
-    if (block_data) {
-        // If the lookup doesn't return NULL, the IP is in the map.
-        // We don't even need to check the timestamp here in the kernel.
-        // If it's in the map, it's banned. The user-space handles the aging!
-        return XDP_DROP;
     }
 
     // ----------------------------------------------------
