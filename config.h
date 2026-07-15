@@ -22,6 +22,14 @@
     #define AGING_THRESHOLD 86400       // 24 hours
 #endif
 
+// ==============================================================================
+// STORAGE CONFIGURATION
+// ==============================================================================
+
+#define IPS_SAVE_DIR "../data"
+#define CSV_FILE "../data/blocklist.csv"
+#define CSV_TEMP "../data/blocklist_temp.csv"
+
 // Calculated values (Do not edit)
 #define ONE_SECOND_NS 1000000000ULL // Define 1 second in nanoseconds (1 billion)
 #define REFILL_INTERVAL_NS (ONE_SECOND_NS / RATE_PPS)
