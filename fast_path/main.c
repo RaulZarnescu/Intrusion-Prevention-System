@@ -8,16 +8,34 @@
 #include <bpf/bpf.h>
 #include <time.h>
 #include <net/if.h>
+#include <sys/resource.h>
 
 #include "ips_fast_common.h"
 
 int main(int argc, char **argv) {
     //Disable output buffering so printf shows up immediately in CLion
     setbuf(stdout, NULL);
-
-    struct ips_bpf *skel;
+    
     int err;
+    
+    // Tell the kernel to allow our 65,000-entry maps to allocate RAM.
+    struct rlimit rlim = {
+        .rlim_cur = RLIM_INFINITY,
+        .rlim_max = RLIM_INFINITY,
+    };
+    if (setrlimit(RLIMIT_MEMLOCK, &rlim)) {
+        fprintf(stderr, "[!] Failed to increase RLIMIT_MEMLOCK!\n");
+        return 1;
+    }
 
+    // 3. Open and load the eBPF program into the kernel
+    struct ips_bpf *skel = ips_bpf__open_and_load();
+    if (!skel) {
+        // If this prints, it means the kernel actively rejected our eBPF code
+        fprintf(stderr, "[!] FATAL: Failed to open and load BPF skeleton.\n");
+        return 1; 
+    }    
+    
     // ----------------------------------------------------------------
     // AUTO-DETECT NETWORK INTERFACE & ATTACH
     // ----------------------------------------------------------------
@@ -47,35 +65,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // 2. Bump the memory limits. eBPF needs to lock memory in RAM.
-    struct rlimit rlim = {
-        .rlim_cur = 512UL << 20,
-        .rlim_max = 512UL << 20,
-    };
-    setrlimit(RLIMIT_MEMLOCK, &rlim);
-
-    // 3. Open and load the eBPF program into the kernel
-    skel = ips_bpf__open_and_load();
-    if (!skel) {
-        fprintf(stderr, "Failed to open and load BPF skeleton\n");
-        return 1;
-    }
-
-    // 4. Attach the XDP program to your network interface
-    // Note: "fast_path_parser" must exactly match the name of the C function in your ips.bpf.c file
-    struct bpf_link *link = bpf_program__attach_xdp(skel->progs.fast_path_parser, ifindex);
-    if (!link) {
-        fprintf(stderr, "Failed to attach XDP program to %s\n", iface);
-        ips_bpf__destroy(skel);
-        return 1;
-    }
-
-    printf("IPS Fast-Path successfully attached to %s!\n", iface);
+    printf("IPS Fast-Path successfully attached to %s!\n", iface_name);
     printf("XDP is active. Listening for traffic...\n");
     printf("(Press Ctrl+C or use CLion's Stop button to exit)\n");
 
     // 5. Keep the user-space program alive so the XDP hook remains attached
-    printf("IPS Fast-Path successfully attached to %s!\n", iface);
+    printf("IPS Fast-Path successfully attached to %s!\n", iface_name);
     printf("Monitoring traffic... Press Ctrl+C to stop.\n\n");
 
     //Get File Descriptors (FDs)
