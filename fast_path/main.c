@@ -12,7 +12,7 @@
 #include "ips_fast_common.h"
 
 int main(int argc, char **argv) {
-    // 1. Disable output buffering so printf shows up immediately in CLion
+    //Disable output buffering so printf shows up immediately in CLion
     setbuf(stdout, NULL);
 
     struct ips_bpf *skel;
@@ -27,7 +27,7 @@ int main(int argc, char **argv) {
     // Try native Linux interface
     if ((ifindex = if_nametoindex("enp2s0")) > 0) {
         iface_name = "enp2s0";
-    } 
+    }
     // Try Oracle VM interface
     else if ((ifindex = if_nametoindex("enp0s3")) > 0) {
         iface_name = "enp0s3";

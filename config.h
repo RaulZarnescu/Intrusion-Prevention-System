@@ -6,9 +6,9 @@
 // ==============================================================================
 
 // Comment out the next line to switch to PRODUCTION mode
-#define SO_DEBUG
+#define IPS_DEBUGGING
 
-#ifdef SO_DEBUG
+#ifdef IPS_DEBUGGING
     // --- TESTING SETTINGS ---
     #define RATE_PPS 5                  // Tokens added per second
     #define BURST_TOKENS 10             // Maximum bucket capacity
