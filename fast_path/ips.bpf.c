@@ -4,21 +4,7 @@
 
 //----------------------------------------------------------------------------------------------------------------------
 
-// Standard Ethernet protocol types
-#define ETH_P_IP 0x0800
-#define ETH_P_IPV6 0x86DD
-
-#define MAX_PPS 5
-#define ONE_SECOND_NS 1000000000ULL // Define 1 second in nanoseconds (1 billion)
-
-//----------------------------------------------------------------------------------------------------------------------
-// ==============================================================================
-// #REQ-010: Rate Limit Packets per Second
-// ==============================================================================
-struct rate_limit_data {
-    __u64 timestamp; // The start of the 1-second window (in nanoseconds)
-    __u32 count;     // How many packets seen in this window
-};
+#include "ips_fast_common.h"
 
 // ==============================================================================
 // Hash Map Pachet
@@ -27,7 +13,7 @@ struct rate_limit_data {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);                 // The type of map
     __type(key, __u32);                              // The Key: A 32-bit integer (IPv4 address)
-    __type(value, struct rate_limit_data);           // The Value: Our rate limit structure
+    __type(value, struct ips_token_bucket);           // The Value: Our rate limit structure
     __uint(max_entries, 10240);                      // Max IPs to track before the map is full
 } ip_tracker SEC(".maps") ;                          // The name of our map and its special memory section
 
@@ -37,7 +23,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u32);   // Key: Source IPv4 Address
-    __type(value, __u8);  // Value: Just a boolean flag (1 = Blocked)
+    __type(value, struct ips_blocklist_data);
     __uint(max_entries, 65536); // Can hold 65k known malicious IPs
 } blocklist SEC(".maps");
 
@@ -96,55 +82,65 @@ int fast_path_parser(struct xdp_md *ctx) {
     // Grab the source IP from the packet immediately for Rate Limiting
     __u32 src_ip = ip->saddr;
     __u8 *action_flag;
+
     // ----------------------------------------------------
     // PIPELINE STAGE 1
     // #REQ-010: Rate Limiting per-source (PPS)
     // Evaluated first before any deep parsing/logs
     // ----------------------------------------------------
+
     __u64 current_time = bpf_ktime_get_ns();
-    struct rate_limit_data *rl_data;
+    struct ips_token_bucket *bucket;
+    struct ips_token_bucket new_bucket = {0};
 
-    rl_data = bpf_map_lookup_elem(&ip_tracker, &src_ip);
-
-    if (rl_data) {
-        // If exists, Check the time window
-        __u64 time_diff = current_time - rl_data->timestamp;
-
-        if (time_diff > ONE_SECOND_NS) {
-            // More than 1 second has passed. Reset the window.
-            rl_data->timestamp = current_time;
-            rl_data->count = 1;
-        } else {
-            // Still within the 1-second window. Increment the counter.
-            __sync_fetch_and_add(&rl_data->count, 1);
-
-            // --- THE DROP RULE ---
-            if (rl_data->count > MAX_PPS) {
-                bpf_printk("RATE LIMIT: Dropping packet from %pI4 (Count: %d)\n", &src_ip, rl_data->count);
-                return XDP_DROP;
-            }
-        }
+    bucket = bpf_map_lookup_elem(&ip_tracker, &src_ip);
+    if (!bucket) {
+        // First time seeing this IP. Give them a full bucket minus 1 for this packet.
+        new_bucket.last_update = current_time;
+        new_bucket.tokens = BURST_TOKENS - 1;
+        bpf_map_update_elem(&ip_tracker, &src_ip, &new_bucket, BPF_ANY);
     } else {
-        //  Initialize the struct and add to map.
-        struct rate_limit_data new_data = {};
-        new_data.timestamp = current_time;
-        new_data.count = 1;
+        // IP exists. Calculate how much time has passed
+        __u64 time_passed = current_time - bucket->last_update;
+        __u32 tokens_to_add = time_passed / REFILL_INTERVAL_NS;
 
-        bpf_map_update_elem(&ip_tracker, &src_ip, &new_data, BPF_ANY);
+        if (tokens_to_add > 0) {
+            // Refill the bucket, capping it at BURST_TOKENS
+            bucket->tokens += tokens_to_add;
+            if (bucket->tokens > BURST_TOKENS) {
+                bucket->tokens = BURST_TOKENS;
+            }
+            // Move the timestamp forward, preserving fractional time leftovers
+            bucket->last_update += (tokens_to_add * REFILL_INTERVAL_NS);
+        }
+
+        // Check if they have tokens to spend
+        if (bucket->tokens > 0) {
+            bucket->tokens -= 1; // Consume 1 token
+        } else {
+            // Bucket is empty!
+            __sync_fetch_and_add(&bucket->drop_count, 1);
+            return XDP_DROP;
+        }
     }
     // ----------------------------------------------------
     // PIPELINE STAGE 2: Blocklist (#REQ-009)
     // ----------------------------------------------------
 
-    action_flag = bpf_map_lookup_elem(&blocklist, &src_ip);
-    if (action_flag && *action_flag == 1) {
-        // bpf_printk("BLOCKLIST: Dropping known threat %pI4\n", &src_ip);
+    struct ips_blocklist_data *block_data;
+    block_data = bpf_map_lookup_elem(&blocklist, &src_ip);
+
+    if (block_data) {
+        // If the lookup doesn't return NULL, the IP is in the map.
+        // We don't even need to check the timestamp here in the kernel.
+        // If it's in the map, it's banned. The user-space handles the aging!
         return XDP_DROP;
     }
 
     // ----------------------------------------------------
     // PIPELINE STAGE 3: Marcaj Honeypot (#REQ-024)
     // ----------------------------------------------------
+
     action_flag = bpf_map_lookup_elem(&honeypot_map, &src_ip);
     if (action_flag && *action_flag == 1) {
         // bpf_printk("HONEYPOT: Redirecting attacker %pI4\n", &src_ip);
