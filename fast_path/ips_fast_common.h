@@ -19,7 +19,8 @@ struct ips_token_bucket {
 
 struct ips_blocklist_data {
     __u64 ban_timestamp;
-    __u8 is_static;      // 0 = Auto-banned (Dynamic), 1 = Threat Intel (Permanent)
+    __u64 is_static;      // 0 = Auto-banned (Dynamic), 1 = Threat Intel (Permanent)
+    // is_static was made __64 from __8 to avoid padding
 };
 
 #endif /* IPS_FAST_COMMON_H */

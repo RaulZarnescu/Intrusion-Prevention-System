@@ -7,10 +7,72 @@
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
 #include <time.h>
-#include <net/if.h>
-#include <sys/resource.h>
+#include <sys/stat.h>
 
 #include "ips_fast_common.h"
+
+//------------------------------- Functions -----------------------------------------------------
+void load_blocklist_from_csv(int blocklist_fd) {
+    FILE *fp = fopen(CSV_FILE, "r");
+    if (!fp) {
+        printf("[i] No existing blocklist.csv found. Starting fresh.\n");
+        return;
+    }
+
+    char line[256];
+    int count = 0;
+
+    // Read the CSV line by line (Format: IP,Timestamp,IsStatic)
+    while (fgets(line, sizeof(line), fp)) {
+        char ip_str[32];
+        uint64_t ts;
+        int is_static;
+
+        if (sscanf(line, "%31[^,],%lu,%d", ip_str, &ts, &is_static) == 3) {
+            struct in_addr addr;
+            inet_aton(ip_str, &addr); // Convert string to IP integer
+
+            __u32 key = addr.s_addr;
+            struct ips_blocklist_data val = { .ban_timestamp = ts, .is_static = is_static };
+
+            // Push it down into the eBPF kernel map
+            bpf_map_update_elem(blocklist_fd, &key, &val, BPF_ANY);
+            count++;
+        }
+    }
+    fclose(fp);
+    printf("[i] Loaded %d bans from %s\n", count, CSV_FILE);
+}
+
+// Saves RAM to Disk whenever a change happens
+void save_blocklist_to_csv(int blocklist_fd) {
+    FILE *fp = fopen(CSV_TEMP, "w");
+    if (!fp) {
+        fprintf(stderr, "[!] Failed to open temp CSV for writing.\n");
+        return;
+    }
+
+    __u32 key = 0, next_key;
+    struct ips_blocklist_data val;
+
+    // Iterate through every IP in the kernel map and write it to the file
+    while (bpf_map_get_next_key(blocklist_fd, &key, &next_key) == 0) {
+        bpf_map_lookup_elem(blocklist_fd, &next_key, &val);
+
+        struct in_addr addr;
+        addr.s_addr = next_key;
+        fprintf(fp, "%s,%llu,%d\n", inet_ntoa(addr), val.ban_timestamp, val.is_static);
+
+        key = next_key;
+    }
+
+    fclose(fp);
+    // Atomic swap: Replaces the old file with the new one instantly
+    rename(CSV_TEMP, CSV_FILE);
+}
+
+//------------------------------------------------------------------------------------------------------------
+
 
 int main(int argc, char **argv) {
     //Disable output buffering so printf shows up immediately in CLion
@@ -79,8 +141,19 @@ int main(int argc, char **argv) {
     int allowlist_fd = bpf_map__fd(skel->maps.allowlist);
     int honeypot_fd = bpf_map__fd(skel->maps.honeypot_map);
 
+    // --- INITIALIZE STORAGE DIRECTORY ---
+    // 0755 means: Owner can read/write/execute. Others can read/execute.
+    if (mkdir(IPS_SAVE_DIR, 0755) == 0) {
+        printf("[i] Created new storage directory at %s\n", IPS_SAVE_DIR);
+    }
+
+    // --- LOAD SAVED DATA ---
+    load_blocklist_from_csv(blocklist_fd);
+
     while (1) {
         sleep(1);
+
+        bool map_changed = 0;
 
         __u32 key = 0, next_key;
         struct ips_token_bucket value;
@@ -114,6 +187,8 @@ int main(int argc, char **argv) {
                 // Insert into the Blocklist Map
                 bpf_map_update_elem(blocklist_fd, &next_key, &block_data, BPF_ANY);
                 printf("[!] FLOOD DETECTED: %s banned! Drops: %d\n", inet_ntoa(ip_addr), value.drop_count);
+
+                map_changed = 1; //flag for change of map
 
                 bpf_map_delete_elem(tracker_fd, &next_key);
             }
@@ -150,9 +225,16 @@ int main(int argc, char **argv) {
                     //Remove them from the eBPF blocklist.
                     bpf_map_delete_elem(blocklist_fd, &bl_next_key);
                     printf("[i] AGING: IP %s has served its time. Unbanned.\n", inet_ntoa(unban_ip));
+
+                    map_changed = 1; //flag for change of map
                 }
             }
             bl_key = bl_next_key;
+        }
+
+        if (map_changed) {
+            save_blocklist_to_csv(blocklist_fd);
+            printf("[i] Blocklist saved to disk.\n");
         }
 
         printf("------------------------------------\n\n");
