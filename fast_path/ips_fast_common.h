@@ -31,4 +31,15 @@ struct ips_ban_event {
     __u32 drop_count;
 };
 
+// ==============================================================================
+// #REQ-XXX: .ini config file
+// ==============================================================================
+
+struct ips_config {
+    unsigned int ban_duration_sec;
+    unsigned int token_bucket_max;
+    unsigned int token_refill_rate;
+    unsigned int max_tolerated_drops;
+};
+
 #endif /* IPS_FAST_COMMON_H */

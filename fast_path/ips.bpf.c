@@ -55,6 +55,13 @@ struct {
     __uint(max_entries, 256 * 1024); // 256 KB buffer
 } ban_events SEC(".maps");
 
+// ==============================================================================
+// Runtime Configuration (.rodata)
+// ==============================================================================
+volatile const __u32 burst_tokens = 50;
+volatile const __u32 max_tolerated_drops = 15;
+volatile const __u64 refill_interval_ns = 50000000ULL; // Default (20 PPS)
+
 //----------------------------------------------------------------------------------------------------------------------
 
 SEC("xdp")
@@ -120,21 +127,21 @@ int fast_path_parser(struct xdp_md *ctx) {
     if (!bucket) {
         // First time seeing this IP. Give them a full bucket minus 1 for this packet.
         new_bucket.last_update = current_time;
-        new_bucket.tokens = BURST_TOKENS - 1;
+        new_bucket.tokens = burst_tokens - 1;
         bpf_map_update_elem(&ip_tracker, &src_ip, &new_bucket, BPF_ANY);
     } else {
         // IP exists. Calculate how much time has passed
         __u64 time_passed = current_time - bucket->last_update;
-        __u32 tokens_to_add = time_passed / REFILL_INTERVAL_NS;
+        __u32 tokens_to_add = time_passed / refill_interval_ns;
 
         if (tokens_to_add > 0) {
-            // Refill the bucket, capping it at BURST_TOKENS
+            // Refill the bucket, capping it at burst_tokens
             bucket->tokens += tokens_to_add;
-            if (bucket->tokens > BURST_TOKENS) {
-                bucket->tokens = BURST_TOKENS;
+            if (bucket->tokens > burst_tokens) {
+                bucket->tokens = burst_tokens;
             }
             // Move the timestamp forward, preserving fractional time leftovers
-            bucket->last_update += (tokens_to_add * REFILL_INTERVAL_NS);
+            bucket->last_update += (tokens_to_add * refill_interval_ns);
 
             // Graceful reset: forgive minor packet drops since the IP backed off and waited for tokens
             if (bucket->drop_count > 0) {
@@ -149,7 +156,7 @@ int fast_path_parser(struct xdp_md *ctx) {
             // Bucket is empty!
             __sync_fetch_and_add(&bucket->drop_count, 1);
 
-            if (bucket->drop_count > MAX_TOLERATED_DROPS) {
+            if (bucket->drop_count > max_tolerated_drops) {
                 // Ultra-optimization: Instantly block the IP at pipeline stage 1!
                 // We use 0 as the timestamp because BPF wall-clock time isn't trivially synced here.
                 // User-space will correct this timestamp in a millisecond via the ring buffer event.

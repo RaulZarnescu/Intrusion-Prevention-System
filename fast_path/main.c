@@ -9,10 +9,62 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <string.h>
+#include <stdlib.h>
 
 #include "ips_fast_common.h"
 
 //------------------------------- Functions -----------------------------------------------------
+
+void load_config(const char *filename, struct ips_config *config) {
+    // SET DEFAULTS
+    config->ban_duration_sec = 3600;
+    config->token_bucket_max = 50;
+    config->token_refill_rate = 10;
+    config->max_tolerated_drops = 15;
+
+    // OPEN THE FILE
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        fprintf(stderr, "[*] /config/config.ini not found. Using safe defaults.\n");
+        return;
+    }
+
+    char line[256];
+    char key[128], value[128];
+
+    // READ LINE-BY-LINE
+    while (fgets(line, sizeof(line), file)) {
+
+        // Skip comments
+        if (line[0] == '#' || line[0] == ';' || line[0] == '\n') {
+            continue;
+        }
+
+        // EXTRACT KEY AND VALUE
+
+        if (sscanf(line, " %127[^= ] = %127s", key, value) == 2) {
+
+            // MAP STRINGS TO STRUCT VARIABLES
+            if (strcmp(key, "ban_duration_seconds") == 0) {
+                config->ban_duration_sec = atoi(value); // atoi converts string to int
+            }
+            else if (strcmp(key, "token_bucket_max") == 0) {
+                config->token_bucket_max = atoi(value);
+            }
+            else if (strcmp(key, "token_refill_rate") == 0) {
+                config->token_refill_rate = atoi(value);
+            }
+            else if (strcmp(key, "max_tolerated_drops") == 0) {
+                config->max_tolerated_drops = atoi(value);
+            }
+        }
+    }
+
+    fclose(file);
+    printf("[+] Configuration loaded successfully.\n");
+}
+
 void load_blocklist_from_csv(int blocklist_fd) {
     FILE *fp = fopen(CSV_FILE, "r");
     if (!fp) {
@@ -130,6 +182,18 @@ int main(int argc, char **argv) {
     setbuf(stdout, NULL);
     
     int err;
+
+    struct ips_config current_config;
+
+    // Load the settings
+    load_config(CONFIG_FILE_PATH, &current_config);
+
+    //
+    printf("Starting IPS with: \n");
+    printf("Ban Duration: %u seconds\n", current_config.ban_duration_sec);
+    printf("Max Tolerated Drops: %u drops\n", current_config.max_tolerated_drops);
+    printf("Bucket size: %u tokens\n", current_config.token_bucket_max);
+    printf("Token Refill Rate: %u tokens/sec \n", current_config.token_refill_rate);
     
     // Tell the kernel to allow our 65,000-entry maps to allocate RAM.
     struct rlimit rlim = {
@@ -141,12 +205,29 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // 3. Open and load the eBPF program into the kernel
-    struct ips_bpf *skel = ips_bpf__open_and_load();
+    // Open the eBPF program without loading it into the kernel yet
+    struct ips_bpf *skel = ips_bpf__open();
     if (!skel) {
-        // If this prints, it means the kernel actively rejected our eBPF code
-        fprintf(stderr, "[!] FATAL: Failed to open and load BPF skeleton.\n");
-        return 1; 
+        fprintf(stderr, "[!] FATAL: Failed to open BPF skeleton.\n");
+        return 1;
+    }
+
+    // INJECT CONFIG INTO THE KERNEL via .rodata
+    skel->rodata->burst_tokens = current_config.token_bucket_max;
+    skel->rodata->max_tolerated_drops = current_config.max_tolerated_drops;
+    // Calculate the refill interval in nanoseconds (1 second = 1,000,000,000 ns)
+    if (current_config.token_refill_rate > 0) {
+        skel->rodata->refill_interval_ns = 1000000000ULL / current_config.token_refill_rate;
+    } else {
+        skel->rodata->refill_interval_ns = 1000000000ULL; // Fallback to 1 PPS
+    }
+
+    // Now load the program into the kernel with our injected configuration
+    err = ips_bpf__load(skel);
+    if (err) {
+        fprintf(stderr, "[!] FATAL: Failed to load BPF skeleton.\n");
+        ips_bpf__destroy(skel);
+        return 1;
     }    
     
     // ----------------------------------------------------------------
@@ -237,7 +318,7 @@ int main(int argc, char **argv) {
 
             // We ONLY age out dynamic bans (is_static == 0)
             if (bl_value.is_static == 0) {
-                if ((current_time - bl_value.ban_timestamp) > AGING_THRESHOLD) {
+                if ((current_time - bl_value.ban_timestamp) > current_config.ban_duration_sec) {
 
                     struct in_addr unban_ip;
                     unban_ip.s_addr = bl_next_key;
