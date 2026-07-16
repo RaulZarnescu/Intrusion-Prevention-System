@@ -13,7 +13,7 @@
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);                 // The type of map
     __type(key, __u32);                              // The Key: A 32-bit integer (IPv4 address)
-    __type(value, struct ips_token_bucket);           // The Value: Our rate limit structure
+    __type(value, struct ips_token_bucket);          // The Value: Our rate limit structure
     __uint(max_entries, 10240);                      // Max IPs to track before the map is full
 } ip_tracker SEC(".maps") ;                          // The name of our map and its special memory section
 
@@ -42,7 +42,7 @@ struct {
 // ==============================================================================
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH); // Auto-evicts old entries to save memory
-    __type(key, __u32);   // Key: Source IPv4 Address
+    __type(key, struct flow_key);   // Key: 5-tuple connection identifier
     __type(value, __u8);  // Value: Boolean flag (1 = Trusted Flow)
     __uint(max_entries, 131072); // Can track ~131k simultaneous trusted connections
 } allowlist SEC(".maps");
@@ -185,9 +185,47 @@ int fast_path_parser(struct xdp_md *ctx) {
     }
 
     // ----------------------------------------------------
+    // LAYER 4: PREPARE FLOW KEY FOR OFFLOAD
+    // ----------------------------------------------------
+    int ip_hdr_len = ip->ihl * 4;
+
+    if (ip_hdr_len < sizeof(struct iphdr)) {
+        return XDP_PASS;
+    }
+
+    if ((void *)((__u8 *)ip + ip_hdr_len) > data_end) {
+        return XDP_PASS;
+    }
+
+    // Initialize to 0 to prevent padding garbage from failing map lookups
+    struct flow_key current_flow = {0};
+    current_flow.source_ip = ip->saddr;
+    current_flow.dest_ip = ip->daddr;
+    current_flow.protocol = ip->protocol;
+
+    if (ip->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcp = (void *)((__u8 *)ip + ip_hdr_len);
+        if ((void *)(tcp + 1) > data_end) {
+            return XDP_PASS;
+        }
+        current_flow.source_port = tcp->source;
+        current_flow.dest_port = tcp->dest;
+    } else if (ip->protocol == IPPROTO_UDP) {
+        struct udphdr *udp = (void *)((__u8 *)ip + ip_hdr_len);
+        if ((void *)(udp + 1) > data_end) {
+            return XDP_PASS;
+        }
+        current_flow.source_port = udp->source;
+        current_flow.dest_port = udp->dest;
+    } else {
+        // Not TCP/UDP (e.g., ICMP). Pass to slow-path.
+        return XDP_PASS;
+    }
+
+    // ----------------------------------------------------
     // PIPELINE STAGE 4: Dynamic Flow Offload / Allowlist (#REQ-007)
     // ----------------------------------------------------
-    action_flag = bpf_map_lookup_elem(&allowlist, &src_ip);
+    action_flag = bpf_map_lookup_elem(&allowlist, &current_flow);
     if (action_flag && *action_flag == 1) {
         // Traffic is known and trusted by the Slow-Path.
         return XDP_PASS;
@@ -198,37 +236,6 @@ int fast_path_parser(struct xdp_md *ctx) {
     // ----------------------------------------------------
     // If it survived the rate limiter, isn't blocked, isn't a honeypot target,
     // and isn't offloaded yet, it gets passed to the OS/Slow-Path for L7 inspection.
-
-
-    // ----------------------------------------------------
-    // LAYER 4: TCP / UDP Headers
-    // ----------------------------------------------------
-    // Calculate full IP header length (including options)
-    int ip_hdr_len = ip->ihl * 4;
-
-    // Sanity check: A valid IP header is at least 20 bytes
-    if (ip_hdr_len < sizeof(struct iphdr)) {
-        return XDP_PASS;
-    }
-
-    // Make sure we don't read past the variable-length IP options
-    if ((void *)((__u8 *)ip + ip_hdr_len) > data_end) {
-        return XDP_PASS;
-    }
-
-    if (ip->protocol == IPPROTO_TCP) {
-        struct tcphdr *tcp = (void *)((__u8 *)ip + ip_hdr_len);
-
-        // BOUNDS CHECK: Is there enough data for the TCP header?
-        if ((void *)(tcp + 1) > data_end) {
-            return XDP_PASS;
-        }
-
-        // Log the TCP packet to trace_pipe
-        bpf_printk("[TCP] %pI4:%d -> %pI4:%d\n",
-                   &ip->saddr, bpf_ntohs(tcp->source),
-                   &ip->daddr, bpf_ntohs(tcp->dest));
-    }
 
     // If we made it here, the packet is safe to pass!
     return XDP_PASS;

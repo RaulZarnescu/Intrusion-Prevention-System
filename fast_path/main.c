@@ -45,6 +45,29 @@ void load_blocklist_from_csv(int blocklist_fd) {
     printf("[i] Loaded %d bans from %s\n", count, CSV_FILE);
 }
 
+void test_manual_offload(int allowlist_fd) {
+    struct flow_key test_flow = {0};
+    
+    // Pune IP-ul real al mașinii client (de unde trimiți testul iperf3)
+    test_flow.source_ip = inet_addr("192.168.56.1"); 
+    
+    // Pune IP-ul real al mașinii server (IPS - cea cu IP-ul detectat acum)
+    test_flow.dest_ip = inet_addr("192.168.56.103"); 
+    
+    test_flow.source_port = htons(12345); 
+    test_flow.dest_port = htons(5201);
+    test_flow.protocol = IPPROTO_TCP;
+
+    __u8 trust_flag = 1;
+
+    int err = bpf_map_update_elem(allowlist_fd, &test_flow, &trust_flag, BPF_ANY);
+    if (err == 0) {
+        printf("\n[TEST] Successfully injected fake offload flow into eBPF map!\n");
+    } else {
+        perror("\n[TEST] Failed to inject flow");
+    }
+}
+
 // Saves RAM to Disk whenever a change happens
 void save_blocklist_to_csv(int blocklist_fd) {
     FILE *fp = fopen(CSV_TEMP, "w");

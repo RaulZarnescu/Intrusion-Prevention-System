@@ -31,4 +31,13 @@ struct ips_ban_event {
     __u32 drop_count;
 };
 
+struct flow_key {
+    __u32 source_ip;
+    __u32 dest_ip;
+    __u16 source_port;
+    __u16 dest_port;
+    __u8 protocol;
+    __u8 padding[3]; // Required to keep the struct 4-byte aligned for eBPF
+};
+
 #endif /* IPS_FAST_COMMON_H */
