@@ -3,6 +3,7 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/Intrusion-Prevention-System.iml" filepath="$PROJECT_DIR$/.idea/Intrusion-Prevention-System.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/Intrusion_Prevention_System.iml" filepath="$PROJECT_DIR$/.idea/Intrusion_Prevention_System.iml" />
     </modules>
   </component>
 </project>

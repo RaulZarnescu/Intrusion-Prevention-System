@@ -97,6 +97,32 @@ void save_blocklist_to_csv(int blocklist_fd) {
 }
 
 //------------------------------------------------------------------------------------------------------------
+// Ring Buffer Callback
+//------------------------------------------------------------------------------------------------------------
+int handle_ban_event(void *ctx, void *data, size_t data_sz) {
+    int blocklist_fd = *(int *)ctx;
+    const struct ips_ban_event *event = data;
+
+    struct in_addr ip_addr;
+    ip_addr.s_addr = event->src_ip;
+
+    printf("[!] FLOOD DETECTED: %s banned! Drops: %d\n", inet_ntoa(ip_addr), event->drop_count);
+
+    // BPF already blocked it to stop traffic instantly, but we need to assign the real timestamp
+    struct ips_blocklist_data block_data;
+    block_data.ban_timestamp = (uint64_t)time(NULL);
+    block_data.is_static = 0;
+
+    bpf_map_update_elem(blocklist_fd, &event->src_ip, &block_data, BPF_ANY);
+
+    // Save to disk so it persists across reboots
+    save_blocklist_to_csv(blocklist_fd);
+    printf("[i] Blocklist saved to disk.\n");
+
+    return 0;
+}
+
+//------------------------------------------------------------------------------------------------------------
 
 
 int main(int argc, char **argv) {
@@ -175,61 +201,30 @@ int main(int argc, char **argv) {
     // --- LOAD SAVED DATA ---
     load_blocklist_from_csv(blocklist_fd);
 
+    // --- SETUP RING BUFFER ---
+    struct ring_buffer *rb = NULL;
+    rb = ring_buffer__new(bpf_map__fd(skel->maps.ban_events), handle_ban_event, &blocklist_fd, NULL);
+    if (!rb) {
+        fprintf(stderr, "[!] Failed to create ring buffer\n");
+        return 1;
+    }
+
+    printf("--- System Status: Event-Driven Mode Active ---\n");
+
     while (1) {
-        sleep(1);
+        // Wait for ban events from the kernel for up to 1 second
+        // If an attack happens, this wakes up instantly (0ms latency).
+        // If nothing happens, it loops every 1 second to run the aging logic.
+        int err = ring_buffer__poll(rb, 1000);
+        if (err < 0) {
+            fprintf(stderr, "[!] Error polling ring buffer: %d\n", err);
+            break;
+        }
 
         bool map_changed = 0;
 
-        __u32 key = 0, next_key;
-        struct ips_token_bucket value;
-
-        printf("--- System Status ---\n");
-
-
         // ====================================================================
-        // LOOP 1: DETECTION (Token Bucket -> Blocklist)
-        // ====================================================================
-
-        // Loop through every entry currently saved in the Hash Map
-        while (bpf_map_get_next_key(tracker_fd, &key, &next_key) == 0) {
-            bpf_map_lookup_elem(tracker_fd, &next_key, &value);
-
-            // Convert the 32-bit integer IP back into a readable string
-            struct in_addr ip_addr;
-            ip_addr.s_addr = next_key;
-
-            // Print the current status
-            printf("IP: %-15s | Tokens: %-3d | Drops: %-3d\n",
-                   inet_ntoa(ip_addr), value.tokens, value.drop_count);
-
-            //Auto-Ban Logic
-            if (value.drop_count > MAX_TOLERATED_DROPS) {
-
-                struct ips_blocklist_data block_data;
-                block_data.ban_timestamp = (uint64_t)time(NULL); // Get current Unix Epoch time (seconds since 1970).
-                block_data.is_static = 0; // Mark as a dynamic ban
-
-                // Insert into the Blocklist Map
-                bpf_map_update_elem(blocklist_fd, &next_key, &block_data, BPF_ANY);
-                printf("[!] FLOOD DETECTED: %s banned! Drops: %d\n", inet_ntoa(ip_addr), value.drop_count);
-
-                map_changed = 1; //flag for change of map
-
-                bpf_map_delete_elem(tracker_fd, &next_key);
-            }
-
-            // Graceful Reset
-            // This forgives minor bursts over time and prevents false positives.
-            else if (value.drop_count > 0) {
-                value.drop_count = 0;
-                bpf_map_update_elem(tracker_fd, &next_key, &value, BPF_EXIST);
-            }
-
-            key = next_key;
-        }
-
-        // ====================================================================
-        // LOOP 2: AGING (Blocklist Eviction)
+        // AGING (Blocklist Eviction)
         // ====================================================================
 
         __u32 bl_key = 0, bl_next_key;
@@ -261,12 +256,10 @@ int main(int argc, char **argv) {
             save_blocklist_to_csv(blocklist_fd);
             printf("[i] Blocklist saved to disk.\n");
         }
-
-        printf("------------------------------------\n\n");
     }
 
     // 6. Cleanup (This runs when you stop the program)
-
+    ring_buffer__free(rb);
     bpf_link__destroy(link);
     ips_bpf__destroy(skel);
     return 0;

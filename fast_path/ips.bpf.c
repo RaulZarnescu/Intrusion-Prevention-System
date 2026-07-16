@@ -47,6 +47,14 @@ struct {
     __uint(max_entries, 131072); // Can track ~131k simultaneous trusted connections
 } allowlist SEC(".maps");
 
+// ==============================================================================
+// Ring Buffer for User-Space Events
+// ==============================================================================
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024); // 256 KB buffer
+} ban_events SEC(".maps");
+
 //----------------------------------------------------------------------------------------------------------------------
 
 SEC("xdp")
@@ -127,6 +135,11 @@ int fast_path_parser(struct xdp_md *ctx) {
             }
             // Move the timestamp forward, preserving fractional time leftovers
             bucket->last_update += (tokens_to_add * REFILL_INTERVAL_NS);
+
+            // Graceful reset: forgive minor packet drops since the IP backed off and waited for tokens
+            if (bucket->drop_count > 0) {
+                bucket->drop_count = 0;
+            }
         }
 
         // Check if they have tokens to spend
@@ -135,6 +148,27 @@ int fast_path_parser(struct xdp_md *ctx) {
         } else {
             // Bucket is empty!
             __sync_fetch_and_add(&bucket->drop_count, 1);
+
+            if (bucket->drop_count > MAX_TOLERATED_DROPS) {
+                // Ultra-optimization: Instantly block the IP at pipeline stage 1!
+                // We use 0 as the timestamp because BPF wall-clock time isn't trivially synced here.
+                // User-space will correct this timestamp in a millisecond via the ring buffer event.
+                struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
+                bpf_map_update_elem(&blocklist, &src_ip, &block_data, BPF_ANY);
+
+                // Now that it's in the blocklist, remove from the active rate limiter tracker
+                bpf_map_delete_elem(&ip_tracker, &src_ip);
+
+                // Notify User-Space for logging and updating the CSV
+                struct ips_ban_event *event;
+                event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
+                if (event) {
+                    event->src_ip = src_ip;
+                    event->drop_count = bucket->drop_count;
+                    bpf_ringbuf_submit(event, 0);
+                }
+            }
+
             return XDP_DROP;
         }
     }

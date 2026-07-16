@@ -23,4 +23,12 @@ struct ips_blocklist_data {
     // is_static was made __64 from __8 to avoid padding
 };
 
+// ==============================================================================
+// #REQ-XXX: Ring Buffer Event
+// ==============================================================================
+struct ips_ban_event {
+    __u32 src_ip;
+    __u32 drop_count;
+};
+
 #endif /* IPS_FAST_COMMON_H */
