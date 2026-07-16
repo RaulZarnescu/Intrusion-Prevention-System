@@ -30,6 +30,8 @@
 #define CSV_FILE "../data/blocklist.csv"
 #define CSV_TEMP "../data/blocklist_temp.csv"
 
+#define BATCH_SIZE 1024 // can be 2048 as raspberry pi has 64kb l1 cache for data
+
 // Calculated values (Do not edit)
 #define ONE_SECOND_NS 1000000000ULL // Define 1 second in nanoseconds (1 billion)
 #define REFILL_INTERVAL_NS (ONE_SECOND_NS / RATE_PPS)

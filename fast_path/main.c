@@ -8,6 +8,7 @@
 #include <bpf/bpf.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 #include "ips_fast_common.h"
 
@@ -52,23 +53,47 @@ void save_blocklist_to_csv(int blocklist_fd) {
         return;
     }
 
-    __u32 key = 0, next_key;
-    struct ips_blocklist_data val;
+    // Allocate arrays in user-space to catch the massive data dump
+    __u32 keys[BATCH_SIZE];
+    struct ips_blocklist_data values[BATCH_SIZE];
 
-    // Iterate through every IP in the kernel map and write it to the file
-    while (bpf_map_get_next_key(blocklist_fd, &key, &next_key) == 0) {
-        bpf_map_lookup_elem(blocklist_fd, &next_key, &val);
+    // Batching state variables
+    __u32 batch_token;
+    void *in_batch = NULL;          // NULL tells the kernel "Start from the beginning"
+    void *out_batch = &batch_token; // The kernel will write the "bookmark" here
+    __u32 count;
+    int err = 0;
 
-        struct in_addr addr;
-        addr.s_addr = next_key;
-        fprintf(fp, "%s,%llu,%d\n", inet_ntoa(addr), val.ban_timestamp, val.is_static);
+    // The Batch Loop
+    while (1) {
+        count = BATCH_SIZE; //tell the kernel max capacity
 
-        key = next_key;
+        err = bpf_map_lookup_batch(blocklist_fd, in_batch, out_batch, keys, values, &count, NULL);
+
+        // Process items the kernel gave us
+        for (__u32 i = 0; i < count; i++) {
+            struct in_addr addr;
+            addr.s_addr = keys[i];
+
+
+            fprintf(fp, "%s,%llu,%llu\n",
+                    inet_ntoa(addr),
+                    (unsigned long long)values[i].ban_timestamp,
+                    (unsigned long long)values[i].is_static);
+        }
+
+        // err == 0 means the batch is full, and there is more data waiting.
+        // err == ENOENT means we successfully reached the absolute end of the map.
+        if (err != 0) {
+            break;
+        }
+
+        // Pass the bookmark back into the kernel for the next loop
+        in_batch = &batch_token;
     }
 
     fclose(fp);
-    // Atomic swap: Replaces the old file with the new one instantly
-    rename(CSV_TEMP, CSV_FILE);
+    rename(CSV_TEMP, CSV_FILE); // Atomic swap
 }
 
 //------------------------------------------------------------------------------------------------------------
