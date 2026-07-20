@@ -144,6 +144,7 @@ int fast_path_parser(struct xdp_md *ctx) {
             bucket->last_update += (tokens_to_add * refill_interval_ns);
 
             // Graceful reset: forgive minor packet drops since the IP backed off and waited for tokens
+            // TODO: maybe a lower max tolerated drops in case of repeated aggressions
             if (bucket->drop_count > 0) {
                 bucket->drop_count = 0;
             }
@@ -157,7 +158,7 @@ int fast_path_parser(struct xdp_md *ctx) {
             __sync_fetch_and_add(&bucket->drop_count, 1);
 
             if (bucket->drop_count > max_tolerated_drops) {
-                // Ultra-optimization: Instantly block the IP at pipeline stage 1!
+
                 // We use 0 as the timestamp because BPF wall-clock time isn't trivially synced here.
                 // User-space will correct this timestamp in a millisecond via the ring buffer event.
                 struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
@@ -232,9 +233,9 @@ int fast_path_parser(struct xdp_md *ctx) {
         }
 
         // Log the TCP packet to trace_pipe
-        bpf_printk("[TCP] %pI4:%d -> %pI4:%d\n",
-                   &ip->saddr, bpf_ntohs(tcp->source),
-                   &ip->daddr, bpf_ntohs(tcp->dest));
+        // bpf_printk("[TCP] %pI4:%d -> %pI4:%d\n",
+        //            &ip->saddr, bpf_ntohs(tcp->source),
+        //            &ip->daddr, bpf_ntohs(tcp->dest));
     }
 
     // If we made it here, the packet is safe to pass!

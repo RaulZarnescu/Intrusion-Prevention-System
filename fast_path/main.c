@@ -50,7 +50,11 @@ void load_config(const char *filename, struct ips_config *config) {
                 config->ban_duration_sec = atoi(value); // atoi converts string to int
             }
             else if (strcmp(key, "token_bucket_max") == 0) {
-                config->token_bucket_max = atoi(value);
+                if (atoi(value)==0) {
+                    printf("[!] config.ini is not valid. Max bucket tokens can not be 0. (Minimum is 1)");
+                    return;
+                }
+                config->token_bucket_max = atoi(value); //debatable if it is worth to switch to strtol for its error detection
             }
             else if (strcmp(key, "token_refill_rate") == 0) {
                 config->token_refill_rate = atoi(value);
@@ -97,17 +101,46 @@ void load_blocklist_from_csv(int blocklist_fd) {
     printf("[i] Loaded %d bans from %s\n", count, CSV_FILE);
 }
 
-// Saves RAM to Disk whenever a change happens
-void save_blocklist_to_csv(int blocklist_fd) {
-    FILE *fp = fopen(CSV_TEMP, "w");
+// ------------------------------------------------------------------------------------------------------------
+// Generic batched map -> CSV dump. Saves RAM to Disk whenever a change happens.
+// `fmt` renders one value of a given map's value type; `value_size` is that type's size,
+// used to stride through the raw batch buffer since map value types differ per map.
+// ------------------------------------------------------------------------------------------------------------
+typedef void (*csv_formatter_fn)(FILE *fp, struct in_addr addr, const void *value);
+
+static void fmt_blocklist_row(FILE *fp, struct in_addr addr, const void *value) {
+    const struct ips_blocklist_data *v = value;
+    fprintf(fp, "%s,%llu,%llu\n", inet_ntoa(addr),
+            (unsigned long long)v->ban_timestamp,
+            (unsigned long long)v->is_static);
+}
+
+static void fmt_tracker_row(FILE *fp, struct in_addr addr, const void *value) {
+    const struct ips_token_bucket *v = value;
+    fprintf(fp, "%s,%llu,%u,%u\n", inet_ntoa(addr),
+            (unsigned long long)v->last_update, v->tokens, v->drop_count);
+}
+
+static void fmt_flag_row(FILE *fp, struct in_addr addr, const void *value) {
+    const __u8 *v = value;
+    fprintf(fp, "%s,%u\n", inet_ntoa(addr), *v);
+}
+
+void save_batch_map_to_csv(int fd, const char *temp_file, const char *final_file,
+                            size_t value_size, csv_formatter_fn fmt) {
+    FILE *fp = fopen(temp_file, "w");
     if (!fp) {
-        fprintf(stderr, "[!] Failed to open temp CSV for writing.\n");
+        fprintf(stderr, "[!] Failed to open temp CSV for writing: %s\n", temp_file);
         return;
     }
 
     // Allocate arrays in user-space to catch the massive data dump
     __u32 keys[BATCH_SIZE];
-    struct ips_blocklist_data values[BATCH_SIZE];
+    void *values = malloc((size_t)BATCH_SIZE * value_size);
+    if (!values) {
+        fclose(fp);
+        return;
+    }
 
     // Batching state variables
     __u32 batch_token;
@@ -120,18 +153,14 @@ void save_blocklist_to_csv(int blocklist_fd) {
     while (1) {
         count = BATCH_SIZE; //tell the kernel max capacity
 
-        err = bpf_map_lookup_batch(blocklist_fd, in_batch, out_batch, keys, values, &count, NULL);
+        err = bpf_map_lookup_batch(fd, in_batch, out_batch, keys, values, &count, NULL);
 
         // Process items the kernel gave us
         for (__u32 i = 0; i < count; i++) {
             struct in_addr addr;
             addr.s_addr = keys[i];
 
-
-            fprintf(fp, "%s,%llu,%llu\n",
-                    inet_ntoa(addr),
-                    (unsigned long long)values[i].ban_timestamp,
-                    (unsigned long long)values[i].is_static);
+            fmt(fp, addr, (const __u8 *)values + (size_t)i * value_size);
         }
 
         // err == 0 means the batch is full, and there is more data waiting.
@@ -144,62 +173,38 @@ void save_blocklist_to_csv(int blocklist_fd) {
         in_batch = &batch_token;
     }
 
+    free(values);
     fclose(fp);
-    rename(CSV_TEMP, CSV_FILE); // Atomic swap
+    rename(temp_file, final_file); // Atomic swap
+}
+
+void save_blocklist_to_csv(int blocklist_fd) {
+    save_batch_map_to_csv(blocklist_fd, CSV_TEMP, CSV_FILE,
+                           sizeof(struct ips_blocklist_data), fmt_blocklist_row);
 }
 
 void save_tracker_to_csv(int tracker_fd) {
-    FILE *fp = fopen(TRACKER_CSV_TEMP, "w");
-    if (!fp) return;
-
-    __u32 keys[BATCH_SIZE];
-    struct ips_token_bucket values[BATCH_SIZE];
-    __u32 batch_token;
-    void *in_batch = NULL;
-    void *out_batch = &batch_token;
-    __u32 count;
-    int err = 0;
-
-    while (1) {
-        count = BATCH_SIZE;
-        err = bpf_map_lookup_batch(tracker_fd, in_batch, out_batch, keys, values, &count, NULL);
-        for (__u32 i = 0; i < count; i++) {
-            struct in_addr addr;
-            addr.s_addr = keys[i];
-            fprintf(fp, "%s,%llu,%u,%u\n", inet_ntoa(addr), (unsigned long long)values[i].last_update, values[i].tokens, values[i].drop_count);
-        }
-        if (err != 0) break;
-        in_batch = &batch_token;
-    }
-    fclose(fp);
-    rename(TRACKER_CSV_TEMP, TRACKER_CSV_FILE);
+    save_batch_map_to_csv(tracker_fd, TRACKER_CSV_TEMP, TRACKER_CSV_FILE,
+                           sizeof(struct ips_token_bucket), fmt_tracker_row);
 }
 
 void save_simple_map_to_csv(int fd, const char *temp_file, const char *final_file) {
-    FILE *fp = fopen(temp_file, "w");
-    if (!fp) return;
+    save_batch_map_to_csv(fd, temp_file, final_file, sizeof(__u8), fmt_flag_row);
+}
 
-    __u32 keys[BATCH_SIZE];
-    __u8 values[BATCH_SIZE];
-    __u32 batch_token;
-    void *in_batch = NULL;
-    void *out_batch = &batch_token;
-    __u32 count;
-    int err = 0;
-
-    while (1) {
-        count = BATCH_SIZE;
-        err = bpf_map_lookup_batch(fd, in_batch, out_batch, keys, values, &count, NULL);
-        for (__u32 i = 0; i < count; i++) {
-            struct in_addr addr;
-            addr.s_addr = keys[i];
-            fprintf(fp, "%s,%u\n", inet_ntoa(addr), values[i]);
-        }
-        if (err != 0) break;
-        in_batch = &batch_token;
+// A new ban only ever adds one entry, so persisting it doesn't need to read the whole
+// map back and rewrite the whole file (O(n) per ban -> O(n^2) for n bans in a burst).
+// Just append the one line. The eBPF map stays the source of truth; save_blocklist_to_csv()
+// (driven by aging, when a ban expires) still does the full rewrite, which reconciles/
+// compacts the file since removing a line from a flat file can't be done incrementally.
+static void append_blocklist_entry_to_csv(struct in_addr addr, const struct ips_blocklist_data *block_data) {
+    FILE *fp = fopen(CSV_FILE, "a");
+    if (!fp) {
+        fprintf(stderr, "[!] Failed to open %s for appending.\n", CSV_FILE);
+        return;
     }
+    fmt_blocklist_row(fp, addr, block_data);
     fclose(fp);
-    rename(temp_file, final_file);
 }
 
 //------------------------------------------------------------------------------------------------------------
@@ -221,9 +226,9 @@ int handle_ban_event(void *ctx, void *data, size_t data_sz) {
 
     bpf_map_update_elem(blocklist_fd, &event->src_ip, &block_data, BPF_ANY);
 
-    // Save to disk so it persists across reboots
-    save_blocklist_to_csv(blocklist_fd);
-    printf("[i] Blocklist saved to disk.\n");
+    // O(1) append instead of an O(n) full blocklist dump per ban event.
+    append_blocklist_entry_to_csv(ip_addr, &block_data);
+    printf("[i] Ban appended to disk.\n");
 
     return 0;
 }
@@ -356,7 +361,10 @@ int main(int argc, char **argv) {
             break;
         }
 
-        bool map_changed = 0;
+        bool blacklist_map_changed = 0;
+        bool whitelist_map_changed = 0;
+        bool honeypot_map_changed = 0;
+        bool ip_tracker_changed = 0;
 
         // ====================================================================
         // AGING (Blocklist Eviction)
@@ -372,7 +380,12 @@ int main(int argc, char **argv) {
 
             // We ONLY age out dynamic bans (is_static == 0)
             if (bl_value.is_static == 0) {
-                if ((current_time - bl_value.ban_timestamp) > current_config.ban_duration_sec) {
+                if (bl_value.ban_timestamp == 0) {
+                    // meaning pending fixup with current time
+                    // TODO: maybe an handling,
+                    // although idk this is usually a breaking point only if the IPS is under attack, that's why i added an if to not unban a timestamp of 0
+                }
+                else if ((current_time - bl_value.ban_timestamp) > current_config.ban_duration_sec) {
 
                     struct in_addr unban_ip;
                     unban_ip.s_addr = bl_next_key;
@@ -381,21 +394,32 @@ int main(int argc, char **argv) {
                     bpf_map_delete_elem(blocklist_fd, &bl_next_key);
                     printf("[i] AGING: IP %s has served its time. Unbanned.\n", inet_ntoa(unban_ip));
 
-                    map_changed = 1; //flag for change of map
+                    blacklist_map_changed = 1; //flag for change of map
                 }
             }
             bl_key = bl_next_key;
         }
 
-        if (map_changed) {
+        if (blacklist_map_changed) {
             save_blocklist_to_csv(blocklist_fd);
             printf("[i] Blocklist saved to disk.\n");
         }
         
         // Dump the other maps for the monitoring TUI
-        save_tracker_to_csv(tracker_fd);
-        save_simple_map_to_csv(allowlist_fd, ALLOWLIST_CSV_TEMP, ALLOWLIST_CSV_FILE);
-        save_simple_map_to_csv(honeypot_fd, HONEYPOT_CSV_TEMP, HONEYPOT_CSV_FILE);
+        if (ip_tracker_changed) {
+            save_tracker_to_csv(tracker_fd);
+            printf("[i] IP list saved to disk.\n");
+        }
+
+        if (whitelist_map_changed) {
+            save_simple_map_to_csv(allowlist_fd, ALLOWLIST_CSV_TEMP, ALLOWLIST_CSV_FILE);
+            printf("[i] Allowlist saved to disk.\n");
+        }
+
+        if (honeypot_map_changed) {
+            save_simple_map_to_csv(honeypot_fd, HONEYPOT_CSV_TEMP, HONEYPOT_CSV_FILE);
+            printf("[i] HONEYPOT list saved to disk.\n");
+        }
     }
 
     // 6. Cleanup (This runs when you stop the program)
