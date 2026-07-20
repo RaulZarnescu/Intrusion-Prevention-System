@@ -148,6 +148,60 @@ void save_blocklist_to_csv(int blocklist_fd) {
     rename(CSV_TEMP, CSV_FILE); // Atomic swap
 }
 
+void save_tracker_to_csv(int tracker_fd) {
+    FILE *fp = fopen(TRACKER_CSV_TEMP, "w");
+    if (!fp) return;
+
+    __u32 keys[BATCH_SIZE];
+    struct ips_token_bucket values[BATCH_SIZE];
+    __u32 batch_token;
+    void *in_batch = NULL;
+    void *out_batch = &batch_token;
+    __u32 count;
+    int err = 0;
+
+    while (1) {
+        count = BATCH_SIZE;
+        err = bpf_map_lookup_batch(tracker_fd, in_batch, out_batch, keys, values, &count, NULL);
+        for (__u32 i = 0; i < count; i++) {
+            struct in_addr addr;
+            addr.s_addr = keys[i];
+            fprintf(fp, "%s,%llu,%u,%u\n", inet_ntoa(addr), (unsigned long long)values[i].last_update, values[i].tokens, values[i].drop_count);
+        }
+        if (err != 0) break;
+        in_batch = &batch_token;
+    }
+    fclose(fp);
+    rename(TRACKER_CSV_TEMP, TRACKER_CSV_FILE);
+}
+
+void save_simple_map_to_csv(int fd, const char *temp_file, const char *final_file) {
+    FILE *fp = fopen(temp_file, "w");
+    if (!fp) return;
+
+    __u32 keys[BATCH_SIZE];
+    __u8 values[BATCH_SIZE];
+    __u32 batch_token;
+    void *in_batch = NULL;
+    void *out_batch = &batch_token;
+    __u32 count;
+    int err = 0;
+
+    while (1) {
+        count = BATCH_SIZE;
+        err = bpf_map_lookup_batch(fd, in_batch, out_batch, keys, values, &count, NULL);
+        for (__u32 i = 0; i < count; i++) {
+            struct in_addr addr;
+            addr.s_addr = keys[i];
+            fprintf(fp, "%s,%u\n", inet_ntoa(addr), values[i]);
+        }
+        if (err != 0) break;
+        in_batch = &batch_token;
+    }
+    fclose(fp);
+    rename(temp_file, final_file);
+}
+
 //------------------------------------------------------------------------------------------------------------
 // Ring Buffer Callback
 //------------------------------------------------------------------------------------------------------------
@@ -337,6 +391,11 @@ int main(int argc, char **argv) {
             save_blocklist_to_csv(blocklist_fd);
             printf("[i] Blocklist saved to disk.\n");
         }
+        
+        // Dump the other maps for the monitoring TUI
+        save_tracker_to_csv(tracker_fd);
+        save_simple_map_to_csv(allowlist_fd, ALLOWLIST_CSV_TEMP, ALLOWLIST_CSV_FILE);
+        save_simple_map_to_csv(honeypot_fd, HONEYPOT_CSV_TEMP, HONEYPOT_CSV_FILE);
     }
 
     // 6. Cleanup (This runs when you stop the program)
