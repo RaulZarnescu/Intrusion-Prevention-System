@@ -79,17 +79,20 @@ void load_blocklist_from_csv(int blocklist_fd) {
     char line[256];
     int count = 0;
 
-    // Read the CSV line by line (Format: IP,Timestamp,IsStatic)
+    // Read the CSV line by line (Format: IP,Prefixlen,Timestamp,IsStatic).
+    // Prefixlen carries CIDR ranges (e.g. threat-intel subnets) through restarts;
+    // single-IP dynamic bans are just the /32 case of the same format.
     while (fgets(line, sizeof(line), fp)) {
         char ip_str[32];
+        unsigned int prefixlen;
         uint64_t ts;
         int is_static;
 
-        if (sscanf(line, "%31[^,],%lu,%d", ip_str, &ts, &is_static) == 3) {
+        if (sscanf(line, "%31[^,],%u,%lu,%d", ip_str, &prefixlen, &ts, &is_static) == 4) {
             struct in_addr addr;
             inet_aton(ip_str, &addr); // Convert string to IP integer
 
-            __u32 key = addr.s_addr;
+            struct lpm_ip_key key = { .prefixlen = prefixlen, .ip = addr.s_addr };
             struct ips_blocklist_data val = { .ban_timestamp = ts, .is_static = is_static };
 
             // Push it down into the eBPF kernel map
@@ -103,31 +106,38 @@ void load_blocklist_from_csv(int blocklist_fd) {
 
 // ------------------------------------------------------------------------------------------------------------
 // Generic batched map -> CSV dump. Saves RAM to Disk whenever a change happens.
-// `fmt` renders one value of a given map's value type; `value_size` is that type's size,
-// used to stride through the raw batch buffer since map value types differ per map.
+// `fmt` renders one key/value pair; `key_size`/`value_size` are that map's key/value type
+// sizes, used to stride through the raw batch buffers since both differ per map (e.g. the
+// blocklist's LPM_TRIE key is a struct lpm_ip_key, not a bare __u32 like the other maps).
 // ------------------------------------------------------------------------------------------------------------
-typedef void (*csv_formatter_fn)(FILE *fp, struct in_addr addr, const void *value);
+typedef void (*csv_formatter_fn)(FILE *fp, const void *key, const void *value);
 
-static void fmt_blocklist_row(FILE *fp, struct in_addr addr, const void *value) {
+static void fmt_blocklist_row(FILE *fp, const void *key, const void *value) {
+    const struct lpm_ip_key *k = key;
     const struct ips_blocklist_data *v = value;
-    fprintf(fp, "%s,%llu,%llu\n", inet_ntoa(addr),
+    struct in_addr addr = { .s_addr = k->ip };
+    fprintf(fp, "%s,%u,%llu,%llu\n", inet_ntoa(addr), k->prefixlen,
             (unsigned long long)v->ban_timestamp,
             (unsigned long long)v->is_static);
 }
 
-static void fmt_tracker_row(FILE *fp, struct in_addr addr, const void *value) {
+static void fmt_tracker_row(FILE *fp, const void *key, const void *value) {
+    const __u32 *k = key;
     const struct ips_token_bucket *v = value;
+    struct in_addr addr = { .s_addr = *k };
     fprintf(fp, "%s,%llu,%u,%u\n", inet_ntoa(addr),
             (unsigned long long)v->last_update, v->tokens, v->drop_count);
 }
 
-static void fmt_flag_row(FILE *fp, struct in_addr addr, const void *value) {
+static void fmt_flag_row(FILE *fp, const void *key, const void *value) {
+    const __u32 *k = key;
     const __u8 *v = value;
+    struct in_addr addr = { .s_addr = *k };
     fprintf(fp, "%s,%u\n", inet_ntoa(addr), *v);
 }
 
 void save_batch_map_to_csv(int fd, const char *temp_file, const char *final_file,
-                            size_t value_size, csv_formatter_fn fmt) {
+                            size_t key_size, size_t value_size, csv_formatter_fn fmt) {
     FILE *fp = fopen(temp_file, "w");
     if (!fp) {
         fprintf(stderr, "[!] Failed to open temp CSV for writing: %s\n", temp_file);
@@ -135,9 +145,11 @@ void save_batch_map_to_csv(int fd, const char *temp_file, const char *final_file
     }
 
     // Allocate arrays in user-space to catch the massive data dump
-    __u32 keys[BATCH_SIZE];
+    void *keys = malloc((size_t)BATCH_SIZE * key_size);
     void *values = malloc((size_t)BATCH_SIZE * value_size);
-    if (!values) {
+    if (!keys || !values) {
+        free(keys);
+        free(values);
         fclose(fp);
         return;
     }
@@ -157,10 +169,8 @@ void save_batch_map_to_csv(int fd, const char *temp_file, const char *final_file
 
         // Process items the kernel gave us
         for (__u32 i = 0; i < count; i++) {
-            struct in_addr addr;
-            addr.s_addr = keys[i];
-
-            fmt(fp, addr, (const __u8 *)values + (size_t)i * value_size);
+            fmt(fp, (const __u8 *)keys + (size_t)i * key_size,
+                    (const __u8 *)values + (size_t)i * value_size);
         }
 
         // err == 0 means the batch is full, and there is more data waiting.
@@ -173,6 +183,7 @@ void save_batch_map_to_csv(int fd, const char *temp_file, const char *final_file
         in_batch = &batch_token;
     }
 
+    free(keys);
     free(values);
     fclose(fp);
     rename(temp_file, final_file); // Atomic swap
@@ -180,16 +191,16 @@ void save_batch_map_to_csv(int fd, const char *temp_file, const char *final_file
 
 void save_blocklist_to_csv(int blocklist_fd) {
     save_batch_map_to_csv(blocklist_fd, CSV_TEMP, CSV_FILE,
-                           sizeof(struct ips_blocklist_data), fmt_blocklist_row);
+                           sizeof(struct lpm_ip_key), sizeof(struct ips_blocklist_data), fmt_blocklist_row);
 }
 
 void save_tracker_to_csv(int tracker_fd) {
     save_batch_map_to_csv(tracker_fd, TRACKER_CSV_TEMP, TRACKER_CSV_FILE,
-                           sizeof(struct ips_token_bucket), fmt_tracker_row);
+                           sizeof(__u32), sizeof(struct ips_token_bucket), fmt_tracker_row);
 }
 
 void save_simple_map_to_csv(int fd, const char *temp_file, const char *final_file) {
-    save_batch_map_to_csv(fd, temp_file, final_file, sizeof(__u8), fmt_flag_row);
+    save_batch_map_to_csv(fd, temp_file, final_file, sizeof(__u32), sizeof(__u8), fmt_flag_row);
 }
 
 // A new ban only ever adds one entry, so persisting it doesn't need to read the whole
@@ -197,19 +208,27 @@ void save_simple_map_to_csv(int fd, const char *temp_file, const char *final_fil
 // Just append the one line. The eBPF map stays the source of truth; save_blocklist_to_csv()
 // (driven by aging, when a ban expires) still does the full rewrite, which reconciles/
 // compacts the file since removing a line from a flat file can't be done incrementally.
-static void append_blocklist_entry_to_csv(struct in_addr addr, const struct ips_blocklist_data *block_data) {
+static void append_blocklist_entry_to_csv(struct lpm_ip_key key, const struct ips_blocklist_data *block_data) {
     FILE *fp = fopen(CSV_FILE, "a");
     if (!fp) {
         fprintf(stderr, "[!] Failed to open %s for appending.\n", CSV_FILE);
         return;
     }
-    fmt_blocklist_row(fp, addr, block_data);
+    fmt_blocklist_row(fp, &key, block_data);
     fclose(fp);
 }
 
 //------------------------------------------------------------------------------------------------------------
 // Ring Buffer Callback
 //------------------------------------------------------------------------------------------------------------
+
+static const char *ban_reason_to_str(__u32 reason) {
+    switch (reason) {
+        case IPS_BAN_REASON_RATE_LIMIT: return "rate limit exceeded";
+        default: return "unknown reason";
+    }
+}
+
 int handle_ban_event(void *ctx, void *data, size_t data_sz) {
     int blocklist_fd = *(int *)ctx;
     const struct ips_ban_event *event = data;
@@ -217,17 +236,24 @@ int handle_ban_event(void *ctx, void *data, size_t data_sz) {
     struct in_addr ip_addr;
     ip_addr.s_addr = event->src_ip;
 
-    printf("[!] FLOOD DETECTED: %s banned! Drops: %d\n", inet_ntoa(ip_addr), event->drop_count);
+    printf("[!] BAN: %s (%s) Drops: %u\n",
+           inet_ntoa(ip_addr), ban_reason_to_str(event->reason), event->drop_count);
 
-    // BPF already blocked it to stop traffic instantly, but we need to assign the real timestamp
+    // Format the key for the LPM Trie (Single IP = /32)
+    struct lpm_ip_key ban_key;
+    ban_key.prefixlen = 32;
+    ban_key.ip = event->src_ip;
+
+    // Prepare the real-time data
     struct ips_blocklist_data block_data;
     block_data.ban_timestamp = (uint64_t)time(NULL);
     block_data.is_static = 0;
 
-    bpf_map_update_elem(blocklist_fd, &event->src_ip, &block_data, BPF_ANY);
+    //Update the kernel map using the new LPM key
+    bpf_map_update_elem(blocklist_fd, &ban_key, &block_data, BPF_ANY);
 
-    // O(1) append instead of an O(n) full blocklist dump per ban event.
-    append_blocklist_entry_to_csv(ip_addr, &block_data);
+    // O(1) append instead of an O(n) full blocklist dump
+    append_blocklist_entry_to_csv(ban_key, &block_data);
     printf("[i] Ban appended to disk.\n");
 
     return 0;
@@ -237,7 +263,7 @@ int handle_ban_event(void *ctx, void *data, size_t data_sz) {
 
 
 int main(int argc, char **argv) {
-    //Disable output buffering so printf shows up immediately in CLion
+    // Disable output buffering so printf shows up immediately in CLion
     setbuf(stdout, NULL);
     
     int err;
@@ -254,7 +280,7 @@ int main(int argc, char **argv) {
     printf("Bucket size: %u tokens\n", current_config.token_bucket_max);
     printf("Token Refill Rate: %u tokens/sec \n", current_config.token_refill_rate);
     
-    // Tell the kernel to allow our 65,000-entry maps to allocate RAM.
+    // Tell the kernel to allow our maps to allocate RAM.
     struct rlimit rlim = {
         .rlim_cur = RLIM_INFINITY,
         .rlim_max = RLIM_INFINITY,
@@ -320,13 +346,12 @@ int main(int argc, char **argv) {
 
     printf("IPS Fast-Path successfully attached to %s!\n", iface_name);
     printf("XDP is active. Listening for traffic...\n");
-    printf("(Press Ctrl+C or use CLion's Stop button to exit)\n");
+    printf("(Press Ctrl+C to exit)\n");
 
-    // 5. Keep the user-space program alive so the XDP hook remains attached
-    printf("IPS Fast-Path successfully attached to %s!\n", iface_name);
+    // Keep the user-space program alive so the XDP hook remains attached
     printf("Monitoring traffic... Press Ctrl+C to stop.\n\n");
 
-    //Get File Descriptors (FDs)
+    // Get File Descriptors (FDs)
     int tracker_fd = bpf_map__fd(skel->maps.ip_tracker);
     int blocklist_fd = bpf_map__fd(skel->maps.blocklist);
     int allowlist_fd = bpf_map__fd(skel->maps.allowlist);
@@ -370,9 +395,16 @@ int main(int argc, char **argv) {
         // AGING (Blocklist Eviction)
         // ====================================================================
 
-        __u32 bl_key = 0, bl_next_key;
+        // bl_key starts at prefixlen=32/ip=0 as a "doesn't exist" sentinel: the LPM_TRIE
+        // falls back to the leftmost (first) entry when the given key isn't found, same as
+        // a HASH map does for a key of 0. Deletions are collected and applied only after the
+        // walk finishes, since deleting the pivot key mid-walk is fragile for LPM_TRIE.
+        struct lpm_ip_key bl_key = { .prefixlen = 32, .ip = 0 }, bl_next_key;
         struct ips_blocklist_data bl_value;
         uint64_t current_time = (uint64_t)time(NULL);
+
+        struct lpm_ip_key expired_keys[BATCH_SIZE];
+        int expired_count = 0;
 
         while (bpf_map_get_next_key(blocklist_fd, &bl_key, &bl_next_key) == 0) {
 
@@ -386,18 +418,23 @@ int main(int argc, char **argv) {
                     // although idk this is usually a breaking point only if the IPS is under attack, that's why i added an if to not unban a timestamp of 0
                 }
                 else if ((current_time - bl_value.ban_timestamp) > current_config.ban_duration_sec) {
-
-                    struct in_addr unban_ip;
-                    unban_ip.s_addr = bl_next_key;
-
-                    //Remove them from the eBPF blocklist.
-                    bpf_map_delete_elem(blocklist_fd, &bl_next_key);
-                    printf("[i] AGING: IP %s has served its time. Unbanned.\n", inet_ntoa(unban_ip));
-
-                    blacklist_map_changed = 1; //flag for change of map
+                    if (expired_count < BATCH_SIZE) {
+                        expired_keys[expired_count++] = bl_next_key;
+                    }
                 }
             }
             bl_key = bl_next_key;
+        }
+
+        for (int i = 0; i < expired_count; i++) {
+            struct in_addr unban_ip;
+            unban_ip.s_addr = expired_keys[i].ip;
+
+            //Remove them from the eBPF blocklist.
+            bpf_map_delete_elem(blocklist_fd, &expired_keys[i]);
+            printf("[i] AGING: IP %s has served its time. Unbanned.\n", inet_ntoa(unban_ip));
+
+            blacklist_map_changed = 1; //flag for change of map
         }
 
         if (blacklist_map_changed) {
@@ -422,7 +459,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    // 6. Cleanup (This runs when you stop the program)
+    // Cleanup (This runs when you stop the program)
     ring_buffer__free(rb);
     bpf_link__destroy(link);
     ips_bpf__destroy(skel);

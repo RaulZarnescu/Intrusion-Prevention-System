@@ -21,10 +21,11 @@ struct {
 // #REQ-009 & #REQ-057: Static/Dynamic Blocklist Map
 // ==============================================================================
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, __u32);   // Key: Source IPv4 Address
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __type(key, struct lpm_ip_key);
     __type(value, struct ips_blocklist_data);
-    __uint(max_entries, 65536); // Can hold 65k known malicious IPs
+    __uint(max_entries, 262144); // Can hold 256k known malicious IPs/subnets
+    __uint(map_flags, BPF_F_NO_PREALLOC); // the kernel cannot pre-allocate memory for an LPM Trie
 } blocklist SEC(".maps");
 
 // ==============================================================================
@@ -104,13 +105,15 @@ int fast_path_parser(struct xdp_md *ctx) {
     // After testing, decided to set it first due to writing overhead caused by incrementing pachet drops on already banned ip's
     // ----------------------------------------------------
 
-    struct ips_blocklist_data *block_data;
-    block_data = bpf_map_lookup_elem(&blocklist, &src_ip);
 
-    if (block_data) {
-        // If the lookup doesn't return NULL, the IP is in the map.
-        // We don't even need to check the timestamp here in the kernel.
-        // If it's in the map, it's banned. The user-space handles the aging!
+    // THE PACKET LOOKUP
+    struct lpm_ip_key search_key = {};
+    search_key.prefixlen = 32;     // A packet is always a single exact IP (/32) (ONLY IPv4)
+    search_key.ip = ip->saddr;
+
+
+    struct ips_blocklist_data *blocked = bpf_map_lookup_elem(&blocklist, &search_key);
+    if (blocked) {
         return XDP_DROP;
     }
 
@@ -143,10 +146,13 @@ int fast_path_parser(struct xdp_md *ctx) {
             // Move the timestamp forward, preserving fractional time leftovers
             bucket->last_update += (tokens_to_add * refill_interval_ns);
 
-            // Graceful reset: forgive minor packet drops since the IP backed off and waited for tokens
+            // Graceful decay: forgive drops in proportion to tokens earned back, instead of
+            // wiping drop_count on any partial refill. A full reset here let an attacker pace
+            // packets just above the refill interval, re-forgiving itself every tick and never
+            // reaching max_tolerated_drops no matter how many packets it had dropped overall.
             // TODO: maybe a lower max tolerated drops in case of repeated aggressions
             if (bucket->drop_count > 0) {
-                bucket->drop_count = 0;
+                bucket->drop_count = (tokens_to_add >= bucket->drop_count) ? 0 : bucket->drop_count - tokens_to_add;
             }
         }
 
@@ -159,21 +165,31 @@ int fast_path_parser(struct xdp_md *ctx) {
 
             if (bucket->drop_count > max_tolerated_drops) {
 
-                // We use 0 as the timestamp because BPF wall-clock time isn't trivially synced here.
-                // User-space will correct this timestamp in a millisecond via the ring buffer event.
+                // Wrap the IP in the LPM key format (/32 for single IP)
+                struct lpm_ip_key ban_key = {};
+                ban_key.prefixlen = 32;
+                ban_key.ip = src_ip;
+
                 struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
-                bpf_map_update_elem(&blocklist, &src_ip, &block_data, BPF_ANY);
 
-                // Now that it's in the blocklist, remove from the active rate limiter tracker
-                bpf_map_delete_elem(&ip_tracker, &src_ip);
+                // LPM_TRIE requires BPF_F_NO_PREALLOC, so inserting a brand-new key allocates
+                // memory right here -- exactly when the system is under attack and memory is
+                // under the most pressure. If that allocation fails, don't clear the tracker
+                // or announce a ban that never actually landed in the map: leave drop_count
+                // and the tracker entry alone so the next packet retries the ban.
+                if (bpf_map_update_elem(&blocklist, &ban_key, &block_data, BPF_ANY) == 0) {
+                    // Now that it's in the blocklist, remove from the active rate limiter tracker
+                    bpf_map_delete_elem(&ip_tracker, &src_ip);
 
-                // Notify User-Space for logging and updating the CSV
-                struct ips_ban_event *event;
-                event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
-                if (event) {
-                    event->src_ip = src_ip;
-                    event->drop_count = bucket->drop_count;
-                    bpf_ringbuf_submit(event, 0);
+                    // Notify User-Space for logging and updating the CSV
+                    struct ips_ban_event *event;
+                    event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
+                    if (event) {
+                        event->src_ip = src_ip;
+                        event->drop_count = bucket->drop_count;
+                        event->reason = IPS_BAN_REASON_RATE_LIMIT;
+                        bpf_ringbuf_submit(event, 0);
+                    }
                 }
             }
 
