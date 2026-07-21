@@ -387,9 +387,6 @@ int main(int argc, char **argv) {
         }
 
         bool blacklist_map_changed = 0;
-        bool whitelist_map_changed = 0;
-        bool honeypot_map_changed = 0;
-        bool ip_tracker_changed = 0;
 
         // ====================================================================
         // AGING (Blocklist Eviction)
@@ -442,21 +439,14 @@ int main(int argc, char **argv) {
             printf("[i] Blocklist saved to disk.\n");
         }
         
-        // Dump the other maps for the monitoring TUI
-        if (ip_tracker_changed) {
-            save_tracker_to_csv(tracker_fd);
-            printf("[i] IP list saved to disk.\n");
-        }
-
-        if (whitelist_map_changed) {
-            save_simple_map_to_csv(allowlist_fd, ALLOWLIST_CSV_TEMP, ALLOWLIST_CSV_FILE);
-            printf("[i] Allowlist saved to disk.\n");
-        }
-
-        if (honeypot_map_changed) {
-            save_simple_map_to_csv(honeypot_fd, HONEYPOT_CSV_TEMP, HONEYPOT_CSV_FILE);
-            printf("[i] HONEYPOT list saved to disk.\n");
-        }
+        // Dump the other maps for the monitoring TUI. Unlike the blocklist, these maps
+        // (especially ip_tracker) can change on nearly every packet with no ring-buffer
+        // event to key off of, so there's no cheap way to know "did it change" from
+        // user-space. Just dump them every poll iteration instead -- the ring buffer poll
+        // above already bounds this loop to ~1/sec when idle, same cadence as the aging check.
+        save_tracker_to_csv(tracker_fd);
+        save_simple_map_to_csv(allowlist_fd, ALLOWLIST_CSV_TEMP, ALLOWLIST_CSV_FILE);
+        save_simple_map_to_csv(honeypot_fd, HONEYPOT_CSV_TEMP, HONEYPOT_CSV_FILE);
     }
 
     // Cleanup (This runs when you stop the program)
