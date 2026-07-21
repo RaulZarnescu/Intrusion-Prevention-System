@@ -69,14 +69,19 @@ def main(stdscr):
         stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
         stdscr.addstr(2, col2_x, "Blocklist")
         stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
-        stdscr.addstr(3, col2_x, f"{'IP Address':<15} | {'Static':<6}")
-        stdscr.addstr(4, col2_x, "-" * 25)
+        stdscr.addstr(3, col2_x, f"{'IP Address':<18} | {'Static':<6}")
+        stdscr.addstr(4, col2_x, "-" * 28)
         
         y = 5
         for row in blocklist[:10]:
-            if len(row) >= 3:
+            if len(row) >= 4:
+                ip, prefixlen, ts, is_static = row[:4]
+                ip_with_prefix = f"{ip}/{prefixlen}" if prefixlen != "32" else ip
+                stdscr.addstr(y, col2_x, f"{ip_with_prefix:<18} | {is_static:<6}")
+                y += 1
+            elif len(row) == 3: # Backwards compatibility for old CSV
                 ip, ts, is_static = row
-                stdscr.addstr(y, col2_x, f"{ip:<15} | {is_static:<6}")
+                stdscr.addstr(y, col2_x, f"{ip:<18} | {is_static:<6}")
                 y += 1
                 
         # Allowlist - Bottom Left
