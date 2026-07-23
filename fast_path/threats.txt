@@ -1,0 +1,10 @@
+# Dummy OSINT Threat Feed
+# Designed to test the C parser
+
+10.99.0.5
+192.168.0.0/16
+
+# A blank line was above this
+not_an_ip_address
+172.16.0.0/12
+1.2.3.4/32
