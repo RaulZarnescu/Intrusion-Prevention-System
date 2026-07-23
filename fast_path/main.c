@@ -265,11 +265,9 @@ int handle_ban_event(void *ctx, void *data, size_t data_sz) {
 int main(int argc, char **argv) {
     // Disable output buffering so printf shows up immediately in CLion
     setbuf(stdout, NULL);
-    
-    int err;
 
     struct ips_config current_config;
-
+    int err; //error variable initialization
     // Load the settings
     load_config(CONFIG_FILE_PATH, &current_config);
 
@@ -314,7 +312,21 @@ int main(int argc, char **argv) {
         ips_bpf__destroy(skel);
         return 1;
     }    
-    
+
+    // BPF filesystem define
+
+    const char *pin_path = "/sys/fs/bpf/ips_blocklist";
+
+    bpf_map__unpin(skel->maps.blocklist, pin_path); //unpin in case we had a crash and it remained unpinned
+
+    err = bpf_map__pin(skel->maps.blocklist, pin_path);
+    if (err) {
+        fprintf(stderr, "[!] FATAL: Failed to pin blocklist map: %d.\n", err);
+        return 1;
+    }
+
+    fprintf(stderr, "[+] Pin blocklist map pinned to %s.\n", pin_path);
+
     // ----------------------------------------------------------------
     // AUTO-DETECT NETWORK INTERFACE & ATTACH
     // ----------------------------------------------------------------
