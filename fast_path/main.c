@@ -23,6 +23,7 @@ void load_config(const char *filename, struct ips_config *config) {
     config->token_bucket_max = 50;
     config->token_refill_rate = 10;
     config->max_tolerated_drops = 15;
+    config->threat_intel_refresh_sec = 86400;
 
     // OPEN THE FILE
     FILE *file = fopen(filename, "r");
@@ -63,6 +64,9 @@ void load_config(const char *filename, struct ips_config *config) {
             else if (strcmp(key, "max_tolerated_drops") == 0) {
                 config->max_tolerated_drops = atoi(value);
             }
+            else if (strcmp(key, "threat_intel_refresh_seconds") == 0) {
+                config->threat_intel_refresh_sec = atoi(value);
+            }
         }
     }
 
@@ -80,24 +84,22 @@ void load_blocklist_from_csv(int blocklist_fd) {
     char line[256];
     int count = 0;
 
-    // Read the CSV line by line (Format: IP,Prefixlen,Timestamp,IsStatic).
-    // Prefixlen carries CIDR ranges (e.g. threat-intel subnets) through restarts;
-    // single-IP dynamic bans are just the /32 case of the same format.
+    // Read the CSV line by line (Format: IP,Prefixlen,Timestamp,IsStatic). blocklist.csv only
+    // ever holds dynamic bans (see filter_dynamic_only at the write side), so prefixlen is
+    // always 32 here -- it's kept in the format for backward compatibility with old CSVs and
+    // with monitor.py, but the dynamic map itself is a plain HASH keyed on the bare IP.
     while (fgets(line, sizeof(line), fp)) {
         char ip_str[32];
-        unsigned int prefixlen;
         uint64_t ts;
-        int is_static;
 
-        if (sscanf(line, "%31[^,],%u,%lu,%d", ip_str, &prefixlen, &ts, &is_static) == 4) {
+        if (sscanf(line, "%31[^,],%*u,%lu,%*d", ip_str, &ts) == 2) {
             struct in_addr addr;
             inet_aton(ip_str, &addr); // Convert string to IP integer
 
-            struct lpm_ip_key key = { .prefixlen = prefixlen, .ip = addr.s_addr };
-            struct ips_blocklist_data val = { .ban_timestamp = ts, .is_static = is_static };
+            struct ips_blocklist_data val = { .ban_timestamp = ts, .is_static = 0 };
 
             // Push it down into the eBPF kernel map
-            bpf_map_update_elem(blocklist_fd, &key, &val, BPF_ANY);
+            bpf_map_update_elem(blocklist_fd, &addr.s_addr, &val, BPF_ANY);
             count++;
         }
     }
@@ -108,30 +110,22 @@ void load_blocklist_from_csv(int blocklist_fd) {
 // ------------------------------------------------------------------------------------------------------------
 // Generic batched map -> CSV dump. Saves RAM to Disk whenever a change happens.
 // `fmt` renders one key/value pair; `key_size`/`value_size` are that map's key/value type
-// sizes, used to stride through the raw batch buffers since both differ per map (e.g. the
-// blocklist's LPM_TRIE key is a struct lpm_ip_key, not a bare __u32 like the other maps).
+// sizes, used to stride through the raw batch buffers since both can differ per map.
 // ------------------------------------------------------------------------------------------------------------
+
 typedef void (*csv_formatter_fn)(FILE *fp, const void *key, const void *value);
 // Returns non-zero to include the row, 0 to skip it. NULL means "include everything".
 typedef int (*csv_filter_fn)(const void *key, const void *value);
 
+// blocklist is now a plain HASH map (dynamic bans only), keyed on the bare IP -- prefixlen
+// is always 32 here but kept in the row format for compatibility with monitor.py.
 static void fmt_blocklist_row(FILE *fp, const void *key, const void *value) {
-    const struct lpm_ip_key *k = key;
+    const __u32 *k = key;
     const struct ips_blocklist_data *v = value;
-    struct in_addr addr = { .s_addr = k->ip };
-    fprintf(fp, "%s,%u,%llu,%llu\n", inet_ntoa(addr), k->prefixlen,
+    struct in_addr addr = { .s_addr = *k };
+    fprintf(fp, "%s,%u,%llu,%llu\n", inet_ntoa(addr), 32,
             (unsigned long long)v->ban_timestamp,
             (unsigned long long)v->is_static);
-}
-
-// Static (threat-intel) entries are injector.c's responsibility to persist -- they already
-// have a durable source in threats.txt, re-injected into the map on every main.c startup.
-// Skip them here so blocklist.csv only ever holds the dynamic bans main.c itself owns;
-// otherwise a full rewrite (triggered by aging) would silently copy injected entries back in.
-static int filter_dynamic_only(const void *key, const void *value) {
-    (void)key;
-    const struct ips_blocklist_data *v = value;
-    return v->is_static == 0;
 }
 
 static void fmt_tracker_row(FILE *fp, const void *key, const void *value) {
@@ -208,9 +202,11 @@ void save_batch_map_to_csv(int fd, const char *temp_file, const char *final_file
 }
 
 void save_blocklist_to_csv(int blocklist_fd) {
+    // No filter needed: blocklist is now structurally dynamic-only (static entries
+    // live in the separate static_blocklist map), so nothing here needs excluding.
     save_batch_map_to_csv(blocklist_fd, CSV_TEMP, CSV_FILE,
-                           sizeof(struct lpm_ip_key), sizeof(struct ips_blocklist_data),
-                           fmt_blocklist_row, filter_dynamic_only);
+                           sizeof(__u32), sizeof(struct ips_blocklist_data),
+                           fmt_blocklist_row, NULL);
 }
 
 void save_tracker_to_csv(int tracker_fd) {
@@ -227,13 +223,13 @@ void save_simple_map_to_csv(int fd, const char *temp_file, const char *final_fil
 // Just append the one line. The eBPF map stays the source of truth; save_blocklist_to_csv()
 // (driven by aging, when a ban expires) still does the full rewrite, which reconciles/
 // compacts the file since removing a line from a flat file can't be done incrementally.
-static void append_blocklist_entry_to_csv(struct lpm_ip_key key, const struct ips_blocklist_data *block_data) {
+static void append_blocklist_entry_to_csv(__u32 ip, const struct ips_blocklist_data *block_data) {
     FILE *fp = fopen(CSV_FILE, "a");
     if (!fp) {
         fprintf(stderr, "[!] Failed to open %s for appending.\n", CSV_FILE);
         return;
     }
-    fmt_blocklist_row(fp, &key, block_data);
+    fmt_blocklist_row(fp, &ip, block_data);
     fclose(fp);
 }
 
@@ -258,21 +254,16 @@ int handle_ban_event(void *ctx, void *data, size_t data_sz) {
     printf("[!] BAN: %s (%s) Drops: %u\n",
            inet_ntoa(ip_addr), ban_reason_to_str(event->reason), event->drop_count);
 
-    // Format the key for the LPM Trie (Single IP = /32)
-    struct lpm_ip_key ban_key;
-    ban_key.prefixlen = 32;
-    ban_key.ip = event->src_ip;
-
     // Prepare the real-time data
     struct ips_blocklist_data block_data;
     block_data.ban_timestamp = (uint64_t)time(NULL);
     block_data.is_static = 0;
 
-    //Update the kernel map using the new LPM key
-    bpf_map_update_elem(blocklist_fd, &ban_key, &block_data, BPF_ANY);
+    // blocklist is a plain HASH map keyed on the bare IP
+    bpf_map_update_elem(blocklist_fd, &event->src_ip, &block_data, BPF_ANY);
 
     // O(1) append instead of an O(n) full blocklist dump
-    append_blocklist_entry_to_csv(ban_key, &block_data);
+    append_blocklist_entry_to_csv(event->src_ip, &block_data);
     printf("[i] Ban appended to disk.\n");
 
     return 0;
@@ -333,18 +324,18 @@ int main(int argc, char **argv) {
     }    
 
     // BPF filesystem define
+    // Only static_blocklist needs a pin: it's the one ips_injector reaches from outside
+    // this process. Nothing external touches the dynamic blocklist map.
 
-    const char *pin_path = "/sys/fs/bpf/ips_blocklist";
+    bpf_map__unpin(skel->maps.static_blocklist, STATIC_BLOCKLIST_PIN_PATH); //unpin in case we had a crash and it remained unpinned
 
-    bpf_map__unpin(skel->maps.blocklist, pin_path); //unpin in case we had a crash and it remained unpinned
-
-    err = bpf_map__pin(skel->maps.blocklist, pin_path);
+    err = bpf_map__pin(skel->maps.static_blocklist, STATIC_BLOCKLIST_PIN_PATH);
     if (err) {
-        fprintf(stderr, "[!] FATAL: Failed to pin blocklist map: %d.\n", err);
+        fprintf(stderr, "[!] FATAL: Failed to pin static_blocklist map: %d.\n", err);
         return 1;
     }
 
-    fprintf(stderr, "[+] Pin blocklist map pinned to %s.\n", pin_path);
+    fprintf(stderr, "[+] static_blocklist map pinned to %s.\n", STATIC_BLOCKLIST_PIN_PATH);
 
     // ----------------------------------------------------------------
     // AUTO-DETECT NETWORK INTERFACE & ATTACH
@@ -384,7 +375,8 @@ int main(int argc, char **argv) {
 
     // Get File Descriptors (FDs)
     int tracker_fd = bpf_map__fd(skel->maps.ip_tracker);
-    int blocklist_fd = bpf_map__fd(skel->maps.blocklist);
+    int blocklist_fd = bpf_map__fd(skel->maps.blocklist);               // dynamic bans (HASH)
+    int static_blocklist_fd = bpf_map__fd(skel->maps.static_blocklist); // threat-intel (LPM_TRIE)
     int allowlist_fd = bpf_map__fd(skel->maps.allowlist);
     int honeypot_fd = bpf_map__fd(skel->maps.honeypot_map);
 
@@ -398,12 +390,14 @@ int main(int argc, char **argv) {
     load_blocklist_from_csv(blocklist_fd);
 
     // --- REBUILD STATIC THREAT INTEL ---
-    // The map is fresh on every restart (the pin just points at whatever ips_bpf__load()
-    // created this run), and static entries are deliberately never written to blocklist.csv
-    // (see filter_dynamic_only), so threats.txt is their only durable source. Re-run the
-    // injection here instead of requiring an operator to rerun ips_injector by hand after
-    // every restart; ips_injector remains available for hot-updating the live map later.
-    inject_threat_intel(THREATS_INTEL_FILE, blocklist_fd);
+    // static_blocklist is fresh on every restart (the pin just points at whatever
+    // ips_bpf__load() created this run), and it's never written to blocklist.csv, so
+    // threats.txt is its only durable source. Re-run the injection here instead of requiring
+    // an operator to rerun ips_injector by hand after every restart; ips_injector remains
+    // available for hot-updating the live map while the daemon keeps running.
+    inject_threat_intel(THREATS_INTEL_FILE, static_blocklist_fd);
+    // Anchors the periodic re-check below so it doesn't immediately re-run at t=0.
+    uint64_t last_static_refresh = (uint64_t)time(NULL);
 
     // --- SETUP RING BUFFER ---
     struct ring_buffer *rb = NULL;
@@ -426,37 +420,36 @@ int main(int argc, char **argv) {
         }
 
         bool blacklist_map_changed = 0;
-
-        // ====================================================================
-        // AGING (Blocklist Eviction)
-        // ====================================================================
-
-        // bl_key starts at prefixlen=32/ip=0 as a "doesn't exist" sentinel: the LPM_TRIE
-        // falls back to the leftmost (first) entry when the given key isn't found, same as
-        // a HASH map does for a key of 0. Deletions are collected and applied only after the
-        // walk finishes, since deleting the pivot key mid-walk is fragile for LPM_TRIE.
-        struct lpm_ip_key bl_key = { .prefixlen = 32, .ip = 0 }, bl_next_key;
-        struct ips_blocklist_data bl_value;
         uint64_t current_time = (uint64_t)time(NULL);
 
-        struct lpm_ip_key expired_keys[BATCH_SIZE];
+        // ====================================================================
+        // AGING (Dynamic Blocklist Eviction)
+        // ====================================================================
+        // blocklist is now the dynamic-only HASH map, so this walk never has to wade
+        // through threat-intel entries just to skip them -- every key it visits is
+        // always eligible for aging.
+
+        // bl_key starts at 0 as a "doesn't exist yet" sentinel, same convention a HASH
+        // map's first bpf_map_get_next_key() call expects. Deletions are collected and
+        // applied only after the walk finishes, since deleting mid-walk is fragile.
+        __u32 bl_key = 0, bl_next_key;
+        struct ips_blocklist_data bl_value;
+
+        __u32 expired_keys[BATCH_SIZE];
         int expired_count = 0;
 
         while (bpf_map_get_next_key(blocklist_fd, &bl_key, &bl_next_key) == 0) {
 
             bpf_map_lookup_elem(blocklist_fd, &bl_next_key, &bl_value);
 
-            // We ONLY age out dynamic bans (is_static == 0)
-            if (bl_value.is_static == 0) {
-                if (bl_value.ban_timestamp == 0) {
-                    // meaning pending fixup with current time
-                    // TODO: maybe an handling,
-                    // although idk this is usually a breaking point only if the IPS is under attack, that's why i added an if to not unban a timestamp of 0
-                }
-                else if ((current_time - bl_value.ban_timestamp) > current_config.ban_duration_sec) {
-                    if (expired_count < BATCH_SIZE) {
-                        expired_keys[expired_count++] = bl_next_key;
-                    }
+            if (bl_value.ban_timestamp == 0) {
+                // meaning pending fixup with current time
+                // TODO: maybe an handling,
+                // although idk this is usually a breaking point only if the IPS is under attack, that's why i added an if to not unban a timestamp of 0
+            }
+            else if ((current_time - bl_value.ban_timestamp) > current_config.ban_duration_sec) {
+                if (expired_count < BATCH_SIZE) {
+                    expired_keys[expired_count++] = bl_next_key;
                 }
             }
             bl_key = bl_next_key;
@@ -464,7 +457,7 @@ int main(int argc, char **argv) {
 
         for (int i = 0; i < expired_count; i++) {
             struct in_addr unban_ip;
-            unban_ip.s_addr = expired_keys[i].ip;
+            unban_ip.s_addr = expired_keys[i];
 
             //Remove them from the eBPF blocklist.
             bpf_map_delete_elem(blocklist_fd, &expired_keys[i]);
@@ -477,7 +470,52 @@ int main(int argc, char **argv) {
             save_blocklist_to_csv(blocklist_fd);
             printf("[i] Blocklist saved to disk.\n");
         }
-        
+
+        // ====================================================================
+        // STATIC THREAT INTEL: periodic re-injection + TTL sweep
+        // ====================================================================
+        // Runs at most once per threat_intel_refresh_sec (default 24h), so this is the
+        // only place static_blocklist gets walked in full -- keeping it off the 1/sec
+        // dynamic aging path is the whole point of having split the two maps.
+        if ((current_time - last_static_refresh) >= current_config.threat_intel_refresh_sec) {
+            // Re-run threats.txt: a pure upsert, so entries still present just get their
+            // ban_timestamp refreshed to "now". Entries no longer in the file simply stop
+            // being refreshed and fall behind, which is what the sweep below acts on.
+            inject_threat_intel(THREATS_INTEL_FILE, static_blocklist_fd);
+
+            // Entries that missed a refresh cycle (delisted from the feed, or the feed/
+            // download failed) age out here instead of staying blocked forever. The TTL is
+            // a multiple of the refresh interval so one missed/late pull doesn't unban
+            // something that's still legitimately on the list.
+            uint64_t static_ttl = 2ULL * current_config.threat_intel_refresh_sec;
+
+            struct lpm_ip_key st_key = { .prefixlen = 32, .ip = 0 }, st_next_key;
+            struct ips_blocklist_data st_value;
+            struct lpm_ip_key expired_static_keys[BATCH_SIZE];
+            int expired_static_count = 0;
+
+            while (bpf_map_get_next_key(static_blocklist_fd, &st_key, &st_next_key) == 0) {
+                bpf_map_lookup_elem(static_blocklist_fd, &st_next_key, &st_value);
+
+                if (st_value.ban_timestamp != 0 &&
+                    (current_time - st_value.ban_timestamp) > static_ttl &&
+                    expired_static_count < BATCH_SIZE) {
+                    expired_static_keys[expired_static_count++] = st_next_key;
+                }
+                st_key = st_next_key;
+            }
+
+            for (int i = 0; i < expired_static_count; i++) {
+                struct in_addr unban_ip;
+                unban_ip.s_addr = expired_static_keys[i].ip;
+                bpf_map_delete_elem(static_blocklist_fd, &expired_static_keys[i]);
+                printf("[i] STATIC AGING: %s/%u missing from threats.txt for too long. Unbanned.\n",
+                       inet_ntoa(unban_ip), expired_static_keys[i].prefixlen);
+            }
+
+            last_static_refresh = current_time;
+        }
+
         // Dump the other maps for the monitoring TUI. Unlike the blocklist, these maps
         // (especially ip_tracker) can change on nearly every packet with no ring-buffer
         // event to key off of, so there's no cheap way to know "did it change" from

@@ -20,6 +20,9 @@
 #define HONEYPOT_CSV_TEMP "../data/honeypot_temp.csv"
 #define CONFIG_FILE_PATH "../config/config.ini"
 #define THREATS_INTEL_FILE "threats.txt"
+// Shared between main.c (pins it) and injector.c (bpf_obj_get's it) so a hot
+// `ips_injector` run reaches the same map main.c self-injects into at boot.
+#define STATIC_BLOCKLIST_PIN_PATH "/sys/fs/bpf/ips_static_blocklist"
 
 #define BATCH_SIZE 1024 // can be 2048 as raspberry pi has 64kb l1 cache for data
 

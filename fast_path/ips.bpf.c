@@ -18,7 +18,23 @@ struct {
 } ip_tracker SEC(".maps") ;                          // The name of our map and its special memory section
 
 // ==============================================================================
-// #REQ-009 & #REQ-057: Static/Dynamic Blocklist Map
+// #REQ-009: Dynamic Blocklist Map (rate-limit bans, always a single /32 IP)
+//
+// Split out from the static/threat-intel list so the userspace aging loop -- which
+// only ever acts on dynamic bans -- can walk just this map instead of scanning past
+// every threat-intel entry too. A plain HASH also means this map is fully
+// pre-allocated at load time, so banning an IP under attack never risks a runtime
+// allocation failure the way inserting into a BPF_F_NO_PREALLOC LPM Trie would.
+// ==============================================================================
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u32);   // Key: Source IPv4 Address
+    __type(value, struct ips_blocklist_data);
+    __uint(max_entries, 65536);
+} blocklist SEC(".maps");
+
+// ==============================================================================
+// #REQ-057: Static Threat-Intel Blocklist Map (CIDR-capable, injector.c owns writes)
 // ==============================================================================
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
@@ -26,7 +42,7 @@ struct {
     __type(value, struct ips_blocklist_data);
     __uint(max_entries, 262144); // Can hold 256k known malicious IPs/subnets
     __uint(map_flags, BPF_F_NO_PREALLOC); // the kernel cannot pre-allocate memory for an LPM Trie
-} blocklist SEC(".maps");
+} static_blocklist SEC(".maps");
 
 // ==============================================================================
 // #REQ-024: Honeypot Redirect Map
@@ -106,14 +122,18 @@ int fast_path_parser(struct xdp_md *ctx) {
     // ----------------------------------------------------
 
 
-    // THE PACKET LOOKUP
+    // THE PACKET LOOKUP -- dynamic (rate-limit) bans first, then static/threat-intel
+    struct ips_blocklist_data *blocked = bpf_map_lookup_elem(&blocklist, &src_ip);
+    if (blocked) {
+        return XDP_DROP;
+    }
+
     struct lpm_ip_key search_key = {};
     search_key.prefixlen = 32;     // A packet is always a single exact IP (/32) (ONLY IPv4)
     search_key.ip = ip->saddr;
 
-
-    struct ips_blocklist_data *blocked = bpf_map_lookup_elem(&blocklist, &search_key);
-    if (blocked) {
+    struct ips_blocklist_data *static_blocked = bpf_map_lookup_elem(&static_blocklist, &search_key);
+    if (static_blocked) {
         return XDP_DROP;
     }
 
@@ -165,20 +185,15 @@ int fast_path_parser(struct xdp_md *ctx) {
 
             if (bucket->drop_count > max_tolerated_drops) {
 
-                // Wrap the IP in the LPM key format (/32 for single IP)
-                struct lpm_ip_key ban_key = {};
-                ban_key.prefixlen = 32;
-                ban_key.ip = src_ip;
-
                 struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
 
-                // LPM_TRIE requires BPF_F_NO_PREALLOC, so inserting a brand-new key allocates
-                // memory right here -- exactly when the system is under attack and memory is
-                // under the most pressure. If that allocation fails, don't clear the tracker
-                // or announce a ban that never actually landed in the map: leave drop_count
-                // and the tracker entry alone so the next packet retries the ban.
+                // blocklist is a pre-allocated HASH map, so this insert can't fail on a
+                // runtime allocation the way an LPM_TRIE (BPF_F_NO_PREALLOC) insert could --
+                // but still check the return value: if it somehow fails, don't clear the
+                // tracker or announce a ban that never actually landed in the map, so the
+                // next packet retries the ban instead of silently letting the attacker through.
 
-                if (bpf_map_update_elem(&blocklist, &ban_key, &block_data, BPF_ANY) == 0) {
+                if (bpf_map_update_elem(&blocklist, &src_ip, &block_data, BPF_ANY) == 0) {
                     // Now that it's in the blocklist, remove from the active rate limiter tracker
                     bpf_map_delete_elem(&ip_tracker, &src_ip);
 

@@ -7,7 +7,7 @@
 #include "ips_fast_common.h"
 #include "threat_intel.h"
 
-int inject_threat_intel(const char *filepath, int blocklist_fd) {
+int inject_threat_intel(const char *filepath, int static_blocklist_fd) {
     FILE *file = fopen(filepath, "r");
     if (!file) {
         perror("[!] Failed to open Threat Intel file");
@@ -54,7 +54,7 @@ int inject_threat_intel(const char *filepath, int blocklist_fd) {
         };
 
         // Kernel Injector
-        if (bpf_map_update_elem(blocklist_fd, &key, &value, BPF_ANY) == 0) {
+        if (bpf_map_update_elem(static_blocklist_fd, &key, &value, BPF_ANY) == 0) {
             injected_count++;
         }else {
             fprintf(stderr, "[-] Failed to inject %s / %u\n", line, prefix);
