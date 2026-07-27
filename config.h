@@ -19,6 +19,7 @@
 #define HONEYPOT_CSV_FILE "../data/honeypot.csv"
 #define HONEYPOT_CSV_TEMP "../data/honeypot_temp.csv"
 #define CONFIG_FILE_PATH "../config/config.ini"
+#define THREATS_INTEL_FILE "threats.txt"
 
 #define BATCH_SIZE 1024 // can be 2048 as raspberry pi has 64kb l1 cache for data
 

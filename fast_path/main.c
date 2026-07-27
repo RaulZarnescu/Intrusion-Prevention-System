@@ -13,6 +13,7 @@
 #include <stdlib.h>
 
 #include "ips_fast_common.h"
+#include "threat_intel.h"
 
 //------------------------------- Functions -----------------------------------------------------
 
@@ -111,6 +112,8 @@ void load_blocklist_from_csv(int blocklist_fd) {
 // blocklist's LPM_TRIE key is a struct lpm_ip_key, not a bare __u32 like the other maps).
 // ------------------------------------------------------------------------------------------------------------
 typedef void (*csv_formatter_fn)(FILE *fp, const void *key, const void *value);
+// Returns non-zero to include the row, 0 to skip it. NULL means "include everything".
+typedef int (*csv_filter_fn)(const void *key, const void *value);
 
 static void fmt_blocklist_row(FILE *fp, const void *key, const void *value) {
     const struct lpm_ip_key *k = key;
@@ -119,6 +122,16 @@ static void fmt_blocklist_row(FILE *fp, const void *key, const void *value) {
     fprintf(fp, "%s,%u,%llu,%llu\n", inet_ntoa(addr), k->prefixlen,
             (unsigned long long)v->ban_timestamp,
             (unsigned long long)v->is_static);
+}
+
+// Static (threat-intel) entries are injector.c's responsibility to persist -- they already
+// have a durable source in threats.txt, re-injected into the map on every main.c startup.
+// Skip them here so blocklist.csv only ever holds the dynamic bans main.c itself owns;
+// otherwise a full rewrite (triggered by aging) would silently copy injected entries back in.
+static int filter_dynamic_only(const void *key, const void *value) {
+    (void)key;
+    const struct ips_blocklist_data *v = value;
+    return v->is_static == 0;
 }
 
 static void fmt_tracker_row(FILE *fp, const void *key, const void *value) {
@@ -137,7 +150,8 @@ static void fmt_flag_row(FILE *fp, const void *key, const void *value) {
 }
 
 void save_batch_map_to_csv(int fd, const char *temp_file, const char *final_file,
-                            size_t key_size, size_t value_size, csv_formatter_fn fmt) {
+                            size_t key_size, size_t value_size, csv_formatter_fn fmt,
+                            csv_filter_fn filter) {
     FILE *fp = fopen(temp_file, "w");
     if (!fp) {
         fprintf(stderr, "[!] Failed to open temp CSV for writing: %s\n", temp_file);
@@ -169,8 +183,12 @@ void save_batch_map_to_csv(int fd, const char *temp_file, const char *final_file
 
         // Process items the kernel gave us
         for (__u32 i = 0; i < count; i++) {
-            fmt(fp, (const __u8 *)keys + (size_t)i * key_size,
-                    (const __u8 *)values + (size_t)i * value_size);
+            const void *k = (const __u8 *)keys + (size_t)i * key_size;
+            const void *v = (const __u8 *)values + (size_t)i * value_size;
+            if (filter && !filter(k, v)) {
+                continue;
+            }
+            fmt(fp, k, v);
         }
 
         // err == 0 means the batch is full, and there is more data waiting.
@@ -191,16 +209,17 @@ void save_batch_map_to_csv(int fd, const char *temp_file, const char *final_file
 
 void save_blocklist_to_csv(int blocklist_fd) {
     save_batch_map_to_csv(blocklist_fd, CSV_TEMP, CSV_FILE,
-                           sizeof(struct lpm_ip_key), sizeof(struct ips_blocklist_data), fmt_blocklist_row);
+                           sizeof(struct lpm_ip_key), sizeof(struct ips_blocklist_data),
+                           fmt_blocklist_row, filter_dynamic_only);
 }
 
 void save_tracker_to_csv(int tracker_fd) {
     save_batch_map_to_csv(tracker_fd, TRACKER_CSV_TEMP, TRACKER_CSV_FILE,
-                           sizeof(__u32), sizeof(struct ips_token_bucket), fmt_tracker_row);
+                           sizeof(__u32), sizeof(struct ips_token_bucket), fmt_tracker_row, NULL);
 }
 
 void save_simple_map_to_csv(int fd, const char *temp_file, const char *final_file) {
-    save_batch_map_to_csv(fd, temp_file, final_file, sizeof(__u32), sizeof(__u8), fmt_flag_row);
+    save_batch_map_to_csv(fd, temp_file, final_file, sizeof(__u32), sizeof(__u8), fmt_flag_row, NULL);
 }
 
 // A new ban only ever adds one entry, so persisting it doesn't need to read the whole
@@ -377,6 +396,14 @@ int main(int argc, char **argv) {
 
     // --- LOAD SAVED DATA ---
     load_blocklist_from_csv(blocklist_fd);
+
+    // --- REBUILD STATIC THREAT INTEL ---
+    // The map is fresh on every restart (the pin just points at whatever ips_bpf__load()
+    // created this run), and static entries are deliberately never written to blocklist.csv
+    // (see filter_dynamic_only), so threats.txt is their only durable source. Re-run the
+    // injection here instead of requiring an operator to rerun ips_injector by hand after
+    // every restart; ips_injector remains available for hot-updating the live map later.
+    inject_threat_intel(THREATS_INTEL_FILE, blocklist_fd);
 
     // --- SETUP RING BUFFER ---
     struct ring_buffer *rb = NULL;

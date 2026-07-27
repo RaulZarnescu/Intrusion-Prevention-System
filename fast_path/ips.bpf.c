@@ -177,6 +177,7 @@ int fast_path_parser(struct xdp_md *ctx) {
                 // under the most pressure. If that allocation fails, don't clear the tracker
                 // or announce a ban that never actually landed in the map: leave drop_count
                 // and the tracker entry alone so the next packet retries the ban.
+
                 if (bpf_map_update_elem(&blocklist, &ban_key, &block_data, BPF_ANY) == 0) {
                     // Now that it's in the blocklist, remove from the active rate limiter tracker
                     bpf_map_delete_elem(&ip_tracker, &src_ip);
@@ -243,7 +244,7 @@ int fast_path_parser(struct xdp_md *ctx) {
     if (ip->protocol == IPPROTO_TCP) {
         struct tcphdr *tcp = (void *)((__u8 *)ip + ip_hdr_len);
 
-        // BOUNDS CHECK: Is there enough data for the TCP header?
+        // BOUNDS CHECK
         if ((void *)(tcp + 1) > data_end) {
             return XDP_PASS;
         }
@@ -254,7 +255,6 @@ int fast_path_parser(struct xdp_md *ctx) {
         //            &ip->daddr, bpf_ntohs(tcp->dest));
     }
 
-    // If we made it here, the packet is safe to pass!
     return XDP_PASS;
 }
 
