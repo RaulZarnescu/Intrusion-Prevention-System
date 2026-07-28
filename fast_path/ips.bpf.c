@@ -14,13 +14,26 @@ struct {
     __uint(max_entries, 10240);
 } ip_tracker SEC(".maps");
 
+// ==============================================================================
+// #REQ-009: Dynamic Blocklist Map (rate-limit bans, always a single /32 IP)
+// ==============================================================================
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u32);   // Key: Source IPv4 Address
+    __type(value, struct ips_blocklist_data);
+    __uint(max_entries, 65536);
+} blocklist SEC(".maps");
+
+// ==============================================================================
+// #REQ-057: Static Threat-Intel Blocklist Map (CIDR-capable, injector.c owns writes)
+// ==============================================================================
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __type(key, struct lpm_ip_key);
     __type(value, struct ips_blocklist_data);
     __uint(max_entries, 262144); // Can hold 256k known malicious IPs/subnets
     __uint(map_flags, BPF_F_NO_PREALLOC); // the kernel cannot pre-allocate memory for an LPM Trie
-} blocklist SEC(".maps");
+} static_blocklist SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -71,13 +84,18 @@ int fast_path_parser(struct xdp_md *ctx) {
     // caused by incrementing packet drops on already banned IPs
     // ====================================================
 
+    // THE PACKET LOOKUP -- dynamic (rate-limit) bans first, then static/threat-intel
+    struct ips_blocklist_data *blocked = bpf_map_lookup_elem(&blocklist, &src_ip);
+    if (blocked) {
+        return XDP_DROP;
+    }
+
     struct lpm_ip_key search_key = {};
     search_key.prefixlen = 32;     // A packet is always a single exact IP (/32) (ONLY IPv4)
     search_key.ip = ip->saddr;
-    //bpf_printk("[IPS-DEBUG] 1. Checking LPM Blocklist\n", 35);
-    struct ips_blocklist_data *blocked = bpf_map_lookup_elem(&blocklist, &search_key);
-    if (blocked) {
-        //bpf_printk("[IPS-DEBUG] -> Blocked: IP is Banned!\n", 34);
+
+    struct ips_blocklist_data *static_blocked = bpf_map_lookup_elem(&static_blocklist, &search_key);
+    if (static_blocked) {
         return XDP_DROP;
     }
 
@@ -121,18 +139,9 @@ int fast_path_parser(struct xdp_md *ctx) {
             if (bucket->drop_count > max_tolerated_drops) {
                 //bpf_printk("[IPS-DEBUG] -> Max tolerated drops crossed: Triggering Ban!\n");
 
-                // Wrap the IP in the LPM key format (/32 for single IP)
-                struct lpm_ip_key ban_key = {};
-                ban_key.prefixlen = 32;
-                ban_key.ip = src_ip;
-
                 struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
 
-                // LPM_TRIE requires BPF_F_NO_PREALLOC, so inserting a brand-new key allocates
-                // memory right here -- exactly when the system is under attack and memory is
-                // under the most pressure. If that allocation fails, don't clear the tracker
-                // or announce a ban that never actually landed in the map.
-                if (bpf_map_update_elem(&blocklist, &ban_key, &block_data, BPF_ANY) == 0) {
+                if (bpf_map_update_elem(&blocklist, &src_ip, &block_data, BPF_ANY) == 0) {
                     // Now that it's in the blocklist, remove from the active rate limiter tracker
                     bpf_map_delete_elem(&ip_tracker, &src_ip);
 
@@ -179,20 +188,16 @@ int fast_path_parser(struct xdp_md *ctx) {
     // ====================================================
     // STAGE 3: ALLOWLIST
     // ====================================================
-    //bpf_printk("[IPS-DEBUG] 3. Checking Allowlist\n", 33);
     action_flag = bpf_map_lookup_elem(&allowlist, &current_flow);
     if (action_flag && *action_flag == 1) {
-        bpf_trace_printk("[IPS-DEBUG] -> Bypass: Flow is Allowlisted!\n", 42);
         return XDP_PASS;
     }
 
     // ====================================================
     // STAGE 4: HONEYPOT
     // ====================================================
-    bpf_trace_printk("[IPS-DEBUG] 4. Reached Final Pass / Honeypot\n", 41);
     action_flag = bpf_map_lookup_elem(&honeypot_map, &src_ip);
     if (action_flag && *action_flag == 1) {
-        // (Temporary PASS until DNAT logic is implemented)
         return XDP_PASS; 
     }
 

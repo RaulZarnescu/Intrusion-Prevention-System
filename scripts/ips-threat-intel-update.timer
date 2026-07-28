@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically refresh IPS threat-intel blocklist (threats.txt)
+
+[Timer]
+# Runs once a 12h so it is updated when the fetch (24h) happens
+OnBootSec=5min
+OnUnitActiveSec=12h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

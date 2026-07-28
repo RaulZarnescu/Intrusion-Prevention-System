@@ -14,3 +14,5 @@ cmake-build-debug/
 
 # Compiled executables (add specific names if you have them, e.g., ips_app)
 *.out
+fast_path/ips_loader
+fast_path/ips_injector

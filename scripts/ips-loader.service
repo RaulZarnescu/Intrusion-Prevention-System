@@ -1,0 +1,22 @@
+[Unit]
+Description=IPS Fast-Path XDP Daemon
+After=network-online.target
+# Starting this unit also starts the threat-intel refresh timer, so a single
+# `systemctl enable --now ips-loader.service` is enough — no separate sudo
+# command needed to arm the timer. Wants=, not Requires=: a failed/missing
+# timer must never block or crash the daemon itself.
+Wants=network-online.target ips-threat-intel-update.timer
+
+[Service]
+Type=simple
+# EDIT: path to the repo's build dir on this host
+WorkingDirectory=/home/raul/CLionProjects/Intrusion-Prevention-System/build
+# EDIT: matching path to the built binary
+ExecStart=/home/raul/CLionProjects/Intrusion-Prevention-System/build/fast_path/ips_loader
+Restart=on-failure
+RestartSec=5
+# Needs raw root to load BPF programs and attach XDP.
+User=root
+
+[Install]
+WantedBy=multi-user.target

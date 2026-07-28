@@ -63,6 +63,7 @@ struct ips_config {
     unsigned int token_bucket_max;
     unsigned int token_refill_rate;
     unsigned int max_tolerated_drops;
+    unsigned int threat_intel_refresh_sec; // How often to re-read threats.txt into static_blocklist
 };
 
 struct flow_key {
