@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh IPS threat-intel blocklist (threats.txt) from Spamhaus DROP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# EDIT: path to the repo on this host (e.g. /home/pi/Intrusion-Prevention-System)
+ExecStart=/home/raul/CLionProjects/Intrusion-Prevention-System/scripts/update_threat_intel.sh
+
+User=raul
