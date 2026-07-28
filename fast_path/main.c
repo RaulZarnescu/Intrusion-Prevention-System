@@ -18,6 +18,7 @@
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <net/ethernet.h>
+#include <netpacket/packet.h>
 
 #include "ips_fast_common.h" 
 
@@ -312,6 +313,17 @@ void *slow_path_sniffer(void *arg) {
         perror("Failed to open raw socket for slow-path");
         return NULL;
     }
+    struct sockaddr_ll sll;
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_ifindex = if_nametoindex("enp0s8"); // Change "enp0s8" to your actual traffic interface if different
+    sll.sll_protocol = htons(ETH_P_ALL);
+    
+    if (bind(raw_sock, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
+        perror("Failed to bind raw socket to interface");
+        close(raw_sock);
+        return NULL;
+    }
 
     unsigned char buffer[65536]; 
     printf("[Slow-Path] Packet sniffer thread started and listening...\n");
@@ -342,42 +354,85 @@ void *slow_path_sniffer(void *arg) {
                      (tcp->fin && tcp->psh && tcp->urg)) {
                 
                 __u32 bad_ip = ip->saddr;
+                printf("[Slow-Path] [!] MALICIOUS TCP FLAGS from %s! Banning IP.\n", inet_ntoa(*(struct in_addr *)&ip->saddr));
                 
-                // if (bad_ip != inet_addr("10.0.2.15")) {
-                    printf("[Slow-Path] [!] MALICIOUS TCP FLAGS from %s! Banning IP.\n", inet_ntoa(*(struct in_addr *)&ip->saddr));
-                    
-                    struct ips_blocklist_data block_data;
-                    block_data.ban_timestamp = (uint64_t)time(NULL);
-                    block_data.is_static = 0;
-                    
-                    struct lpm_ip_key ban_key;
-                    ban_key.prefixlen = 32;
-                    ban_key.ip = bad_ip;
-                    
-                    bpf_map_update_elem(fds->blocklist_fd, &ban_key, &block_data, BPF_ANY);
-                    append_blocklist_entry_to_csv(ban_key, &block_data);
-                // }
+                struct ips_blocklist_data block_data;
+                block_data.ban_timestamp = (uint64_t)time(NULL);
+                block_data.is_static = 0;
+                
+                struct lpm_ip_key ban_key;
+                ban_key.prefixlen = 32;
+                ban_key.ip = bad_ip;
+                
+                bpf_map_update_elem(fds->blocklist_fd, &ban_key, &block_data, BPF_ANY);
+                append_blocklist_entry_to_csv(ban_key, &block_data);
                 continue;
             }
 
-            int obs_count = track_and_check_greylist(ip->saddr, 0);
+            // --- ADD THIS FILTER TO IGNORE 10.0.2.15 AND LOOPBACK ---
+            __u32 src_ip = ip->saddr;
+            if (src_ip == inet_addr("10.0.2.15") || (ntohl(src_ip) & 0xFF000000) == 0x7F000000) {
+                continue;
+            }
+            // -------------------------------------------------------
+
+            int obs_count = track_and_check_greylist(src_ip, 0);
             
             if (obs_count > 0 && obs_count < 5) {
-                printf("[Slow-Path] [i] IP %s is clean. Observation count: %d/5\n", inet_ntoa(*(struct in_addr *)&ip->saddr), obs_count);
+                printf("[Slow-Path] [i] IP %s is clean. Observation count: %d/5\n", inet_ntoa(*(struct in_addr *)&src_ip), obs_count);
             }
             else if (obs_count == 5 || obs_count == -1) {
                 if (obs_count == 5) {
-                    track_and_check_greylist(ip->saddr, 1);
-                    printf("[Slow-Path] [+] IP %s proved clean 5 times. Trusting IP!\n", inet_ntoa(*(struct in_addr *)&ip->saddr));
+                    track_and_check_greylist(src_ip, 1);
+                    printf("[Slow-Path] [+] IP %s proved clean 5 times. Trusting IP!\n", inet_ntoa(*(struct in_addr *)&src_ip));
                     
-                    struct lpm_ip_key del_key = { .prefixlen = 32, .ip = ip->saddr };
+                    struct lpm_ip_key del_key = { .prefixlen = 32, .ip = src_ip };
                     bpf_map_delete_elem(fds->blocklist_fd, &del_key);
-                    bpf_map_delete_elem(fds->tracker_fd, &ip->saddr);
+                    bpf_map_delete_elem(fds->tracker_fd, &src_ip);
                 }
                 
                 __u8 trust_flag = 1;
                 bpf_map_update_elem(fds->allowlist_fd, &current_flow, &trust_flag, BPF_ANY);
 
+                struct flow_key reverse_flow = current_flow;
+                reverse_flow.source_ip = current_flow.dest_ip;
+                reverse_flow.dest_ip = current_flow.source_ip;
+                reverse_flow.source_port = current_flow.dest_port;
+                reverse_flow.dest_port = current_flow.source_port;
+                
+                bpf_map_update_elem(fds->allowlist_fd, &reverse_flow, &trust_flag, BPF_ANY);
+            }
+        }
+        else if (ip->protocol == IPPROTO_UDP) {
+            struct udphdr *udp = (struct udphdr *)(buffer + sizeof(struct ethhdr) + ip_hdr_len);
+            current_flow.source_port = udp->source;
+            current_flow.dest_port = udp->dest;
+
+            // --- ADD THIS FILTER TO IGNORE 10.0.2.15 AND LOOPBACK ---
+            __u32 src_ip = ip->saddr;
+            if (src_ip == inet_addr("10.0.2.15") || (ntohl(src_ip) & 0xFF000000) == 0x7F000000) {
+                continue;
+            }
+            // -------------------------------------------------------
+
+            int obs_count = track_and_check_greylist(src_ip, 0);
+            
+            if (obs_count > 0 && obs_count < 5) {
+                printf("[Slow-Path] [i] IP %s is clean. Observation count: %d/5\n", inet_ntoa(*(struct in_addr *)&src_ip), obs_count);
+            }
+            else if (obs_count == 5 || obs_count == -1) {
+                if (obs_count == 5) {
+                    track_and_check_greylist(src_ip, 1); 
+                    printf("[Slow-Path] [+] IP %s proved clean 5 times. Trusting UDP IP!\n", inet_ntoa(*(struct in_addr *)&src_ip));
+                    
+                    struct lpm_ip_key del_key = { .prefixlen = 32, .ip = src_ip };
+                    bpf_map_delete_elem(fds->blocklist_fd, &del_key);
+                    bpf_map_delete_elem(fds->tracker_fd, &src_ip);
+                }
+                
+                __u8 trust_flag = 1;
+                bpf_map_update_elem(fds->allowlist_fd, &current_flow, &trust_flag, BPF_ANY);
+                
                 struct flow_key reverse_flow = current_flow;
                 reverse_flow.source_ip = current_flow.dest_ip;
                 reverse_flow.dest_ip = current_flow.source_ip;

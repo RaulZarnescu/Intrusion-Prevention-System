@@ -74,21 +74,24 @@ int fast_path_parser(struct xdp_md *ctx) {
     struct lpm_ip_key search_key = {};
     search_key.prefixlen = 32;     // A packet is always a single exact IP (/32) (ONLY IPv4)
     search_key.ip = ip->saddr;
-
+    //bpf_printk("[IPS-DEBUG] 1. Checking LPM Blocklist\n", 35);
     struct ips_blocklist_data *blocked = bpf_map_lookup_elem(&blocklist, &search_key);
     if (blocked) {
+        //bpf_printk("[IPS-DEBUG] -> Blocked: IP is Banned!\n", 34);
         return XDP_DROP;
     }
 
     // ====================================================
     // STAGE 2: RATE LIMITER
     // ====================================================
+    //bpf_printk("[IPS-DEBUG] 2. Checking Rate Limiter\n");
     __u64 current_time = bpf_ktime_get_ns();
     struct ips_token_bucket *bucket;
     struct ips_token_bucket new_bucket = {0};
 
     bucket = bpf_map_lookup_elem(&ip_tracker, &src_ip);
     if (!bucket) {
+        //bpf_printk("[IPS-DEBUG] -> Rate Limiter: New IP, bucket created (Pass)\n");
         new_bucket.last_update = current_time;
         new_bucket.tokens = burst_tokens - 1;
         bpf_map_update_elem(&ip_tracker, &src_ip, &new_bucket, BPF_ANY);
@@ -113,8 +116,10 @@ int fast_path_parser(struct xdp_md *ctx) {
         if (bucket->tokens > 0) {
             bucket->tokens -= 1;
         } else {
+            //bpf_printk("[IPS-DEBUG] -> Rate Limit Exceeded: Dropping packet!\n");
             __sync_fetch_and_add(&bucket->drop_count, 1);
             if (bucket->drop_count > max_tolerated_drops) {
+                //bpf_printk("[IPS-DEBUG] -> Max tolerated drops crossed: Triggering Ban!\n");
 
                 // Wrap the IP in the LPM key format (/32 for single IP)
                 struct lpm_ip_key ban_key = {};
@@ -174,14 +179,17 @@ int fast_path_parser(struct xdp_md *ctx) {
     // ====================================================
     // STAGE 3: ALLOWLIST
     // ====================================================
+    //bpf_printk("[IPS-DEBUG] 3. Checking Allowlist\n", 33);
     action_flag = bpf_map_lookup_elem(&allowlist, &current_flow);
     if (action_flag && *action_flag == 1) {
+        bpf_trace_printk("[IPS-DEBUG] -> Bypass: Flow is Allowlisted!\n", 42);
         return XDP_PASS;
     }
 
     // ====================================================
     // STAGE 4: HONEYPOT
     // ====================================================
+    bpf_trace_printk("[IPS-DEBUG] 4. Reached Final Pass / Honeypot\n", 41);
     action_flag = bpf_map_lookup_elem(&honeypot_map, &src_ip);
     if (action_flag && *action_flag == 1) {
         // (Temporary PASS until DNAT logic is implemented)
