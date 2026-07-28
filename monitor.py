@@ -58,11 +58,15 @@ def main(stdscr):
         stdscr.addstr(4, col1_x, "-" * 35)
         
         y = 5
-        for row in tracker[:10]: # show top 10
+        seen_tracker = set()
+        for row in tracker: 
             if len(row) >= 4:
                 ip, ts, tokens, drops = row
-                stdscr.addstr(y, col1_x, f"{ip:<15} | {tokens:<6} | {drops}")
-                y += 1
+                if ip not in seen_tracker:
+                    seen_tracker.add(ip)
+                    if len(seen_tracker) <= 10:  # show top 10 unique
+                        stdscr.addstr(y, col1_x, f"{ip:<15} | {tokens:<6} | {drops}")
+                        y += 1
                 
         # Blocklist - Top Right
         col2_x = max_x // 2
@@ -73,16 +77,23 @@ def main(stdscr):
         stdscr.addstr(4, col2_x, "-" * 28)
         
         y = 5
-        for row in blocklist[:10]:
+        seen_blocklist = set()
+        for row in blocklist:
             if len(row) >= 4:
                 ip, prefixlen, ts, is_static = row[:4]
                 ip_with_prefix = f"{ip}/{prefixlen}" if prefixlen != "32" else ip
-                stdscr.addstr(y, col2_x, f"{ip_with_prefix:<18} | {is_static:<6}")
-                y += 1
+                if ip_with_prefix not in seen_blocklist:
+                    seen_blocklist.add(ip_with_prefix)
+                    if len(seen_blocklist) <= 10:
+                        stdscr.addstr(y, col2_x, f"{ip_with_prefix:<18} | {is_static:<6}")
+                        y += 1
             elif len(row) == 3: # Backwards compatibility for old CSV
                 ip, ts, is_static = row
-                stdscr.addstr(y, col2_x, f"{ip:<18} | {is_static:<6}")
-                y += 1
+                if ip not in seen_blocklist:
+                    seen_blocklist.add(ip)
+                    if len(seen_blocklist) <= 10:
+                        stdscr.addstr(y, col2_x, f"{ip:<18} | {is_static:<6}")
+                        y += 1
                 
         # Allowlist - Bottom Left
         y_bottom = 18
@@ -93,10 +104,15 @@ def main(stdscr):
         stdscr.addstr(y_bottom+2, col1_x, "-" * 15)
         
         y = y_bottom + 3
-        for row in allowlist[:5]:
-            if len(row) >= 2:
-                stdscr.addstr(y, col1_x, f"{row[0]:<15}")
-                y += 1
+        seen_allowlist = set()
+        for row in allowlist:
+            if len(row) >= 1:
+                ip = row[0]
+                if ip not in seen_allowlist:
+                    seen_allowlist.add(ip)
+                    if len(seen_allowlist) <= 5:  # show top 5 unique
+                        stdscr.addstr(y, col1_x, f"{ip:<15}")
+                        y += 1
                 
         # Honeypot - Bottom Right
         stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
@@ -106,10 +122,15 @@ def main(stdscr):
         stdscr.addstr(y_bottom+2, col2_x, "-" * 15)
         
         y = y_bottom + 3
-        for row in honeypot[:5]:
-            if len(row) >= 2:
-                stdscr.addstr(y, col2_x, f"{row[0]:<15}")
-                y += 1
+        seen_honeypot = set()
+        for row in honeypot:
+            if len(row) >= 1:
+                ip = row[0]
+                if ip not in seen_honeypot:
+                    seen_honeypot.add(ip)
+                    if len(seen_honeypot) <= 5:
+                        stdscr.addstr(y, col2_x, f"{ip:<15}")
+                        y += 1
         
         stdscr.addstr(max_y-1, 2, "Press 'q' to quit.")
         stdscr.refresh()

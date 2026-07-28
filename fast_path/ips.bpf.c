@@ -14,26 +14,13 @@ struct {
     __uint(max_entries, 10240);
 } ip_tracker SEC(".maps");
 
-// ==============================================================================
-// #REQ-009: Dynamic Blocklist Map (rate-limit bans, always a single /32 IP)
-// ==============================================================================
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, __u32);   // Key: Source IPv4 Address
-    __type(value, struct ips_blocklist_data);
-    __uint(max_entries, 65536);
-} blocklist SEC(".maps");
-
-// ==============================================================================
-// #REQ-057: Static Threat-Intel Blocklist Map (CIDR-capable, injector.c owns writes)
-// ==============================================================================
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __type(key, struct lpm_ip_key);
     __type(value, struct ips_blocklist_data);
     __uint(max_entries, 262144); // Can hold 256k known malicious IPs/subnets
     __uint(map_flags, BPF_F_NO_PREALLOC); // the kernel cannot pre-allocate memory for an LPM Trie
-} static_blocklist SEC(".maps");
+} blocklist SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -80,36 +67,29 @@ int fast_path_parser(struct xdp_md *ctx) {
 
     // ====================================================
     // STAGE 1: BLOCKLIST
-    // After testing, decided to set it first due to writing overhead 
-    // caused by incrementing packet drops on already banned IPs
     // ====================================================
-
-    // THE PACKET LOOKUP -- dynamic (rate-limit) bans first, then static/threat-intel
-    struct ips_blocklist_data *blocked = bpf_map_lookup_elem(&blocklist, &src_ip);
-    if (blocked) {
-        return XDP_DROP;
-    }
-
     struct lpm_ip_key search_key = {};
     search_key.prefixlen = 32;     // A packet is always a single exact IP (/32) (ONLY IPv4)
     search_key.ip = ip->saddr;
-
-    struct ips_blocklist_data *static_blocked = bpf_map_lookup_elem(&static_blocklist, &search_key);
-    if (static_blocked) {
+    
+    bpf_printk("[IPS-DEBUG] 1. Checking LPM Blocklist\n");
+    struct ips_blocklist_data *blocked = bpf_map_lookup_elem(&blocklist, &search_key);
+    if (blocked) {
+        bpf_printk("[IPS-DEBUG] -> Blocked: IP is Banned!\n");
         return XDP_DROP;
     }
 
     // ====================================================
     // STAGE 2: RATE LIMITER
     // ====================================================
-    //bpf_printk("[IPS-DEBUG] 2. Checking Rate Limiter\n");
+    bpf_printk("[IPS-DEBUG] 2. Checking Rate Limiter\n");
     __u64 current_time = bpf_ktime_get_ns();
     struct ips_token_bucket *bucket;
     struct ips_token_bucket new_bucket = {0};
 
     bucket = bpf_map_lookup_elem(&ip_tracker, &src_ip);
     if (!bucket) {
-        //bpf_printk("[IPS-DEBUG] -> Rate Limiter: New IP, bucket created (Pass)\n");
+        bpf_printk("[IPS-DEBUG] -> Rate Limiter: New IP, bucket created (Pass)\n");
         new_bucket.last_update = current_time;
         new_bucket.tokens = burst_tokens - 1;
         bpf_map_update_elem(&ip_tracker, &src_ip, &new_bucket, BPF_ANY);
@@ -122,10 +102,6 @@ int fast_path_parser(struct xdp_md *ctx) {
             if (bucket->tokens > burst_tokens) bucket->tokens = burst_tokens;
             bucket->last_update += (tokens_to_add * refill_interval_ns);
 
-            // Graceful decay: forgive drops in proportion to tokens earned back, instead of
-            // wiping drop_count on any partial refill. A full reset here let an attacker pace
-            // packets just above the refill interval, re-forgiving itself every tick and never
-            // reaching max_tolerated_drops no matter how many packets it had dropped overall.
             if (bucket->drop_count > 0) {
                 bucket->drop_count = (tokens_to_add >= bucket->drop_count) ? 0 : bucket->drop_count - tokens_to_add;
             }
@@ -134,18 +110,20 @@ int fast_path_parser(struct xdp_md *ctx) {
         if (bucket->tokens > 0) {
             bucket->tokens -= 1;
         } else {
-            //bpf_printk("[IPS-DEBUG] -> Rate Limit Exceeded: Dropping packet!\n");
+            bpf_printk("[IPS-DEBUG] -> Rate Limit Exceeded: Dropping packet!\n");
             __sync_fetch_and_add(&bucket->drop_count, 1);
             if (bucket->drop_count > max_tolerated_drops) {
-                //bpf_printk("[IPS-DEBUG] -> Max tolerated drops crossed: Triggering Ban!\n");
+                bpf_printk("[IPS-DEBUG] -> Max tolerated drops crossed: Triggering Ban!\n");
+
+                struct lpm_ip_key ban_key = {};
+                ban_key.prefixlen = 32;
+                ban_key.ip = src_ip;
 
                 struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
 
-                if (bpf_map_update_elem(&blocklist, &src_ip, &block_data, BPF_ANY) == 0) {
-                    // Now that it's in the blocklist, remove from the active rate limiter tracker
+                if (bpf_map_update_elem(&blocklist, &ban_key, &block_data, BPF_ANY) == 0) {
                     bpf_map_delete_elem(&ip_tracker, &src_ip);
 
-                    // Notify User-Space for logging and updating the CSV
                     struct ips_ban_event *event;
                     event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
                     if (event) {
@@ -188,14 +166,17 @@ int fast_path_parser(struct xdp_md *ctx) {
     // ====================================================
     // STAGE 3: ALLOWLIST
     // ====================================================
+    bpf_printk("[IPS-DEBUG] 3. Checking Allowlist\n");
     action_flag = bpf_map_lookup_elem(&allowlist, &current_flow);
     if (action_flag && *action_flag == 1) {
+        bpf_printk("[IPS-DEBUG] -> Bypass: Flow is Allowlisted!\n");
         return XDP_PASS;
     }
 
     // ====================================================
     // STAGE 4: HONEYPOT
     // ====================================================
+    bpf_printk("[IPS-DEBUG] 4. Reached Final Pass / Honeypot\n");
     action_flag = bpf_map_lookup_elem(&honeypot_map, &src_ip);
     if (action_flag && *action_flag == 1) {
         return XDP_PASS; 
