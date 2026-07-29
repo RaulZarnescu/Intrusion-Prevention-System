@@ -8,10 +8,18 @@ pipeline {
             }
         }
 
-        stage('Hello') {
+        stage('Build') {
             steps {
-                echo 'Jenkins is connected to the Intrusion-Prevention-System repo.'
-                sh 'ls -la'
+                sh '''
+                    cmake -S . -B build
+                    cmake --build build
+                '''
+            }
+        }
+
+        stage('Archive') {
+            steps {
+                archiveArtifacts artifacts: 'build/fast_path/ips_loader, build/fast_path/ips_injector', fingerprint: true
             }
         }
     }
