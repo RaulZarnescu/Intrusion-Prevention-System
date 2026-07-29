@@ -10,6 +10,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // TODO: Use getopt !!!!!!
+    // TODO: Use Jenkins !!!!
+    // TODO: GET BETTER !! LOCK IN <3
+    // TODO: Do tests for verifying if it works !!!
+
     int static_blocklist_fd = bpf_obj_get(STATIC_BLOCKLIST_PIN_PATH);
 
     if (static_blocklist_fd < 0) {
@@ -18,7 +23,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("[+] Successfully connected to kernel static blocklist! (FD: %d)\n", static_blocklist_fd);
+    fprintf(stdout,"[+] Successfully connected to kernel static blocklist! (FD: %d)\n", static_blocklist_fd);
 
     int total_injected = inject_threat_intel(argv[1], static_blocklist_fd);
 

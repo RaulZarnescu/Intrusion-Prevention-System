@@ -70,6 +70,10 @@ int fast_path_parser(struct xdp_md *ctx) {
     // ----------------------------------------------------
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
+    // TODO: IPv6 currently passes completely uninspected (no rate limit, no blocklist,
+    // nothing) -- a real bypass on any dual-stack network. A bounded walk of the common
+    // extension headers (hop-by-hop/routing/fragment, capped at a small max depth) is
+    // feasible in XDP; anything deeper should punt to the slow path like today's IPv4 path.
     if (eth->h_proto != bpf_htons(ETH_P_IP)) return XDP_PASS;
 
     struct iphdr *ip = (void *)(eth + 1);
@@ -177,7 +181,13 @@ int fast_path_parser(struct xdp_md *ctx) {
         if ((void *)(tcp + 1) > data_end) return XDP_PASS;
         current_flow.source_port = tcp->source;
         current_flow.dest_port = tcp->dest;
-    } 
+
+        // TODO: the malformed-flag check (syn+fin, null scan, fin+psh+urg) currently
+        // lives in user-space slow_path_sniffer() in main.c. It's a single-packet,
+        // stateless check with no reassembly needed -- a good candidate to move here
+        // as its own STAGE so it drops at line rate instead of relying on a raw-socket
+        // sniffer that only sees a copy after the fact and can miss packets under load.
+    }
     else if (ip->protocol == IPPROTO_UDP) {
         struct udphdr *udp = (void *)((__u8 *)ip + ip_hdr_len);
         if ((void *)(udp + 1) > data_end) return XDP_PASS;
@@ -195,10 +205,15 @@ int fast_path_parser(struct xdp_md *ctx) {
 
     // ====================================================
     // STAGE 4: HONEYPOT
+    // TODO: this only ever XDP_PASSes flagged IPs -- there's no actual redirect-to-
+    // honeypot (VLAN 100/"dirtnet") wired in yet. Per the spec, that redirect is meant
+    // to happen via br_netfilter DNAT further up the stack (not here in XDP), so this
+    // stage just needs to keep marking/passing; the DNAT rule + Cowrie honeypot + VLAN
+    // 100 routing are the still-missing pieces, all outside this file.
     // ====================================================
     action_flag = bpf_map_lookup_elem(&honeypot_map, &src_ip);
     if (action_flag && *action_flag == 1) {
-        return XDP_PASS; 
+        return XDP_PASS;
     }
 
     // ====================================================

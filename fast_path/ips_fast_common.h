@@ -64,6 +64,8 @@ struct ips_config {
     unsigned int token_refill_rate;
     unsigned int max_tolerated_drops;
     unsigned int threat_intel_refresh_sec; // How often to re-read threats.txt into static_blocklist
+    char wan_interface[16]; // matches IFNAMSIZ; upstream-facing physical interface (e.g. eth0)
+    char lan_interface[16]; // matches IFNAMSIZ; internal-facing physical interface (e.g. eth1)
 };
 
 struct flow_key {

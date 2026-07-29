@@ -1,14 +1,12 @@
 #include <stdio.h>
 #include <unistd.h>
-#include <net/if.h> 
-#include <sys/resource.h>
+#include <net/if.h>
 #include <bpf/libbpf.h>
-#include "ips.skel.h" 
+#include "ips.skel.h"
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
 #include <time.h>
 #include <sys/stat.h>
-#include <errno.h>
 #include <string.h>
 #include <stdlib.h> 
 #include <pthread.h>
@@ -23,6 +21,8 @@
 #include "ips_fast_common.h"
 #include "threat_intel.h"
 
+//----------------------------------------------------------------------------------------------
+
 struct sniffer_args {
     int allowlist_fd;
     int blocklist_fd;
@@ -32,19 +32,51 @@ struct sniffer_args {
 
 //------------------------------- Functions -----------------------------------------------------
 
+bool parse_long(const char *str, long *out_val) {
+    char *endptr;
+    errno = 0;
+
+    long val = strtol(str, &endptr, 10);
+
+    if (errno == ERANGE) { //overflow or underflow
+        return false;
+    }
+
+    if (endptr == str) {
+        return false;
+    }
+    // trailing data ex. "123abc"
+    if (*endptr != '\0' && *endptr != '\n' && *endptr != '\r' && *endptr != ' ') {
+        return false;
+    }
+
+    *out_val = val;
+    return true;
+}
+
+// Copies an interface name from config.ini into a fixed-size ips_config field, truncating
+// to fit, and logs it under the given label ("WAN"/"LAN").
+void set_interface_config_field(char *dest, size_t dest_size, const char *value, const char *label) {
+    strncpy(dest, value, dest_size - 1);
+    dest[dest_size - 1] = '\0';
+    fprintf(stdout, "%s Interface: %s\n", label, dest);
+}
+
 void load_config(const char *filename, struct ips_config *config) {
     config->ban_duration_sec = 3600;
     config->token_bucket_max = 50;
     config->token_refill_rate = 10;
     config->max_tolerated_drops = 15;
     config->threat_intel_refresh_sec = 86400;
+    config->wan_interface[0] = '\0';
+    config->lan_interface[0] = '\0';
 
     FILE *file = fopen(filename, "r");
     if (!file) {
         fprintf(stderr, "[*] /config/config.ini not found. Using safe defaults.\n");
         return;
     }
-
+    printf("Loading IPS with: \n");
     char line[256];
     char key[128], value[128];
 
@@ -52,24 +84,44 @@ void load_config(const char *filename, struct ips_config *config) {
         if (line[0] == '#' || line[0] == ';' || line[0] == '\n') continue;
 
         if (sscanf(line, " %127[^= ] = %127s", key, value) == 2) {
+            if (strcmp(key, "wan_interface") == 0) {
+                set_interface_config_field(config->wan_interface, sizeof(config->wan_interface), value, "WAN");
+                continue;
+            }
+            if (strcmp(key, "lan_interface") == 0) {
+                set_interface_config_field(config->lan_interface, sizeof(config->lan_interface), value, "LAN");
+                continue;
+            }
+
+            long parsed_val;
+            if (!parse_long(value, &parsed_val) || parsed_val < 0) {
+                fprintf(stderr, "[!] Invalid or negative integer for key '%s': %s\n", key, value);
+                continue;
+            }
+
             if (strcmp(key, "ban_duration_seconds") == 0) {
-                config->ban_duration_sec = atoi(value); 
+                config->ban_duration_sec = (unsigned int)parsed_val;
+                fprintf(stdout, "Ban Duration: %u seconds\n", config->ban_duration_sec);
             }
             else if (strcmp(key, "token_bucket_max") == 0) {
-                if (atoi(value)==0) {
-                    printf("[!] config.ini is not valid. Max bucket tokens can not be 0. (Minimum is 1)");
+                if (parsed_val == 0) {
+                    fprintf(stderr, "[!] config.ini is not valid. Max bucket tokens can not be 0. (Minimum is 1)\n");
                     return;
                 }
-                config->token_bucket_max = atoi(value); 
+                config->token_bucket_max = (unsigned int)parsed_val;
+                fprintf(stdout, "Bucket size: %u tokens\n", config->token_bucket_max);
             }
             else if (strcmp(key, "token_refill_rate") == 0) {
-                config->token_refill_rate = atoi(value);
+                config->token_refill_rate = (unsigned int)parsed_val;
+                fprintf(stdout, "Token Refill Rate: %u tokens/sec\n", config->token_refill_rate);
             }
             else if (strcmp(key, "max_tolerated_drops") == 0) {
-                config->max_tolerated_drops = atoi(value);
+                config->max_tolerated_drops = (unsigned int)parsed_val;
+                fprintf(stdout, "Max Tolerated Drops: %u drops\n", config->max_tolerated_drops);
             }
             else if (strcmp(key, "threat_intel_refresh_seconds") == 0) {
-                config->threat_intel_refresh_sec = atoi(value);
+                config->threat_intel_refresh_sec = (unsigned int)parsed_val;
+                fprintf(stdout, "Threat Intel Refresh: %u seconds\n", config->threat_intel_refresh_sec);
             }
         }
     }
@@ -300,38 +352,62 @@ struct grey_ip {
 };
 
 struct grey_ip greylist_tracker[GREYLIST_MAX] = {0};
+// Guards greylist_tracker: with one sniffer thread per interface, the same source IP's
+// traffic can legitimately reach both (a flow allowed through one NIC gets bridged and
+// egresses the other), so concurrent probes into this hand-rolled table need a lock.
+pthread_mutex_t greylist_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int track_and_check_greylist(__u32 src_ip, int mark_authorized) {
     uint32_t idx = src_ip % GREYLIST_MAX;
-    
+    int result = 0;
+
+    pthread_mutex_lock(&greylist_lock);
+
     for (int i = 0; i < 10; i++) {
         uint32_t probe = (idx + i) % GREYLIST_MAX;
-        
+
         if (greylist_tracker[probe].ip == src_ip) {
             if (mark_authorized) {
                 greylist_tracker[probe].authorized = 1;
-                return -1;
+                result = -1;
+                break;
             }
             if (greylist_tracker[probe].authorized) {
-                return -1; 
+                result = -1;
+                break;
             }
             greylist_tracker[probe].count += 1;
-            return greylist_tracker[probe].count;
+            result = greylist_tracker[probe].count;
+            break;
         }
-        
+
         if (greylist_tracker[probe].ip == 0) {
-            if (mark_authorized) return -1;
+            if (mark_authorized) {
+                result = -1;
+                break;
+            }
             greylist_tracker[probe].ip = src_ip;
             greylist_tracker[probe].count = 1;
             greylist_tracker[probe].authorized = 0;
-            return 1;
+            result = 1;
+            break;
         }
     }
-    return 0;
+
+    pthread_mutex_unlock(&greylist_lock);
+    return result;
 }
 
 // ------------------------------------------------------------------------------------------------------------
 // SLOW-PATH: Deep Packet Inspection & Dynamic Allowlisting Thread
+// TODO: this is IPv4-only (see the ETH_P_IP check below) and only does TCP-flag anomaly
+// detection + the "5 clean observations -> trust" greylist bootstrap. Per the spec this
+// path is also supposed to do TLS ClientHello/SNI extraction, JA3/JA4 fingerprinting, and
+// ECH/DoH canary-domain handling -- none of that is wired in here yet. There's a standalone
+// Scapy-based SNI extractor prototype at OoB/Parsers/parsers.py, but it's not called from
+// any live traffic path (it only runs against a hardcoded mock packet at the bottom of the
+// file). IPv6 needs handling too, likely via Scapy here since eBPF can't cheaply do
+// variable-length extension header parsing for the general case.
 // ------------------------------------------------------------------------------------------------------------
 void *slow_path_sniffer(void *arg) {
     struct sniffer_args *fds = (struct sniffer_args *)arg;
@@ -353,8 +429,8 @@ void *slow_path_sniffer(void *arg) {
         return NULL;
     }
 
-    unsigned char buffer[65536]; 
-    printf("[Slow-Path] Packet sniffer thread started and listening...\n");
+    unsigned char buffer[65536];
+    printf("[Slow-Path] Packet sniffer thread started and listening on ifindex %d...\n", fds->ifindex);
 
     while (1) {
         int data_size = recvfrom(raw_sock, buffer, sizeof(buffer), 0, NULL, NULL);
@@ -464,95 +540,134 @@ void *slow_path_sniffer(void *arg) {
     return NULL;
 }
 
-//------------------------------------------------------------------------------------------------------------
-// MAIN
-//------------------------------------------------------------------------------------------------------------
-int main(int argc, char **argv) {
-    setbuf(stdout, NULL);
-    int err;
+int load_skeleton(struct ips_bpf *skel, struct ips_config *config){
+    load_config(CONFIG_FILE_PATH, config);
 
-    struct ips_config current_config;
-    load_config(CONFIG_FILE_PATH, &current_config);
-
-    printf("Starting IPS with: \n");
-    printf("Ban Duration: %u seconds\n", current_config.ban_duration_sec);
-    printf("Max Tolerated Drops: %u drops\n", current_config.max_tolerated_drops);
-    printf("Bucket size: %u tokens\n", current_config.token_bucket_max);
-    printf("Token Refill Rate: %u tokens/sec \n", current_config.token_refill_rate);
-    
-    struct rlimit rlim = {
-        .rlim_cur = RLIM_INFINITY,
-        .rlim_max = RLIM_INFINITY,
-    };
-    if (setrlimit(RLIMIT_MEMLOCK, &rlim)) {
-        fprintf(stderr, "[!] Failed to increase RLIMIT_MEMLOCK!\n");
-        return 1;
-    }
-
-    struct ips_bpf *skel = ips_bpf__open();
-    if (!skel) {
+    if (!skel) { //check pointer
         fprintf(stderr, "[!] FATAL: Failed to open BPF skeleton.\n");
         return 1;
     }
 
-    skel->rodata->burst_tokens = current_config.token_bucket_max;
-    skel->rodata->max_tolerated_drops = current_config.max_tolerated_drops;
-    if (current_config.token_refill_rate > 0) {
-        skel->rodata->refill_interval_ns = 1000000000ULL / current_config.token_refill_rate;
+    skel->rodata->burst_tokens = config->token_bucket_max;
+    skel->rodata->max_tolerated_drops = config->max_tolerated_drops;
+    if (config->token_refill_rate > 0) {
+        skel->rodata->refill_interval_ns = 1000000000ULL / config->token_refill_rate;
     } else {
-        skel->rodata->refill_interval_ns = 1000000000ULL; 
+        skel->rodata->refill_interval_ns = 1000000000ULL;
     }
-
-    err = ips_bpf__load(skel);
-    if (err) {
+    if (ips_bpf__load(skel)) {
         fprintf(stderr, "[!] FATAL: Failed to load BPF skeleton.\n");
         ips_bpf__destroy(skel);
         return 1;
-    }    
+    }
+    return 0;
+}
 
-    // BPF filesystem define
-    // Only static_blocklist needs a pin: it's the one ips_injector reaches from outside
-    // this process. Nothing external touches the dynamic blocklist map.
+// Resolves a configured interface name to its ifindex. Returns 0 (if_nametoindex's own
+// "not found" value) on any failure, so callers can just check `== 0` without a separate
+// error path -- fed by config, never a hardcoded guess, so an operator gets a clear error
+// instead of the daemon silently attaching to the wrong NIC.
+unsigned int resolve_interface(const char *name) {
+    if (!name || name[0] == '\0') {
+        fprintf(stderr, "[!] FATAL: No interface configured.\n");
+        return 0;
+    }
+    unsigned int ifindex = if_nametoindex(name);
+    if (ifindex == 0) {
+        fprintf(stderr, "[!] FATAL: Interface '%s' not found.\n", name);
+        return 0;
+    }
+    printf("[i] Resolved interface %s (Index: %u)\n", name, ifindex);
+    return ifindex;
+}
 
-    bpf_map__unpin(skel->maps.static_blocklist, STATIC_BLOCKLIST_PIN_PATH); //unpin in case we had a crash and it remained unpinned
-
-    err = bpf_map__pin(skel->maps.static_blocklist, STATIC_BLOCKLIST_PIN_PATH);
-    if (err) {
-        fprintf(stderr, "[!] FATAL: Failed to pin static_blocklist map: %d.\n", err);
+int start_sniffer_thread(pthread_t *thread, struct sniffer_args *args) {
+    if (pthread_create(thread, NULL, slow_path_sniffer, args) != 0) {
+        fprintf(stderr, "[!] Failed to create slow-path thread for ifindex %d\n", args->ifindex);
         return 1;
     }
+    return 0;
+}
 
-    fprintf(stderr, "[+] static_blocklist map pinned to %s.\n", STATIC_BLOCKLIST_PIN_PATH);
-
-    int ifindex = 0;
-    const char *iface_name = NULL;
-
-    if ((ifindex = if_nametoindex("enp0s8")) > 0) { // VirtualBox Host-Only adapter
-        iface_name = "enp0s8";
-    }
-    else if ((ifindex = if_nametoindex("enp0s3")) > 0) {
-        iface_name = "enp0s3";
-    }
-    else if ((ifindex = if_nametoindex("enp2s0")) > 0) {
-        iface_name = "enp2s0";
-    }
-
-    if (ifindex <= 0) {
-        fprintf(stderr, "[!] Error: No known network interfaces found!\n");
-        return 1;
-    }
-
-    printf("[i] Using interface %s (Index: %d)\n", iface_name, ifindex);
-
-    struct bpf_link *link = bpf_program__attach_xdp(skel->progs.fast_path_parser, ifindex);
+struct bpf_link *attach_xdp(struct bpf_program *prog, unsigned int ifindex, const char *iface_name) {
+    struct bpf_link *link = bpf_program__attach_xdp(prog, ifindex);
     if (!link) {
         fprintf(stderr, "[!] Failed to attach XDP program to %s\n", iface_name);
+        return NULL;
+    }
+    printf("[+] XDP attached to %s (Index: %u)\n", iface_name, ifindex);
+    return link;
+}
+
+struct network_interfaces {
+    unsigned int wan_ifindex;
+    unsigned int lan_ifindex;
+    struct bpf_link *wan_link;
+    struct bpf_link *lan_link;
+};
+
+// Resolves wan_interface/lan_interface from config and attaches fast_path_parser to both.
+// TODO: assumes both are already bridged (br0) at the OS level (netplan/systemd-networkd)
+// -- this only attaches the XDP filter to each physical member, it doesn't create the
+// bridge itself. Without that bridge existing, XDP_PASS on one NIC has nowhere to go and
+// no traffic actually crosses the Pi.
+// On any failure the relevant ifindex is 0 and/or the relevant link is NULL;
+// resolve_interface()/attach_xdp() already printed the specific error.
+
+struct network_interfaces setup_network_interfaces(struct ips_bpf *skel, const struct ips_config *config) {
+    struct network_interfaces ifaces = {0};
+
+    ifaces.wan_ifindex = resolve_interface(config->wan_interface);
+    ifaces.lan_ifindex = resolve_interface(config->lan_interface);
+    if (ifaces.wan_ifindex == 0 || ifaces.lan_ifindex == 0) {
+        return ifaces;
+    }
+
+    ifaces.wan_link = attach_xdp(skel->progs.fast_path_parser, ifaces.wan_ifindex, config->wan_interface);
+    ifaces.lan_link = attach_xdp(skel->progs.fast_path_parser, ifaces.lan_ifindex, config->lan_interface);
+
+    return ifaces;
+}
+
+int pin_bpf_map(struct bpf_map *map, const char *pin_path) {
+    // BPF filesystem define
+    bpf_map__unpin(map, pin_path); //unpin in case we had a crash and it remained unpinned
+
+    int err = bpf_map__pin(map, pin_path); // pin the common file
+    if (err) {
+        fprintf(stderr, "[!] FATAL: Failed to pin map: %d.\n", err);
+        return 1;
+    }
+    fprintf(stderr, "[+] static_blocklist map pinned to %s.\n", pin_path);
+    return 0;
+}
+
+//------------------------------------------------------------------------------------------------------------
+// MAIN
+//------------------------------------------------------------------------------------------------------------
+int main(int argc, char **argv) {
+    setbuf(stdout, NULL);   //disables buffering on stdout, writes straight in the file descriptor immediately, instead of accumulating in a buffer.
+                            //stderr is already unbuffered from the lib
+    int err;
+
+    struct ips_bpf *skel = ips_bpf__open();
+    struct ips_config current_config;
+
+    if (load_skeleton(skel, &current_config)) { //it also runs the config
         return 1;
     }
 
-    printf("IPS Fast-Path successfully attached to %s!\n", iface_name);
-    printf("XDP is active. Listening for traffic...\n");
-    printf("Monitoring traffic... Press Ctrl+C to stop.\n\n");
+    if (pin_bpf_map(skel->maps.static_blocklist, STATIC_BLOCKLIST_PIN_PATH)) { //pin blacklist map for injection
+        return 1;
+    }
+
+    struct network_interfaces ifaces = setup_network_interfaces(skel, &current_config);
+    if (!ifaces.wan_link || !ifaces.lan_link) {
+        return 1;
+    }
+
+    fprintf(stdout, "IPS Fast-Path successfully attached to %s and %s!\n", current_config.wan_interface, current_config.lan_interface);
+    fprintf(stdout, "XDP is active. Listening for traffic...\n");
 
     int tracker_fd = bpf_map__fd(skel->maps.ip_tracker);
     int blocklist_fd = bpf_map__fd(skel->maps.blocklist);               // dynamic bans (HASH)
@@ -564,27 +679,31 @@ int main(int argc, char **argv) {
         printf("[i] Created new storage directory at %s\n", IPS_SAVE_DIR);
     }
 
-    struct sniffer_args args;
-    args.allowlist_fd = allowlist_fd;
-    args.blocklist_fd = blocklist_fd;
-    args.tracker_fd = tracker_fd;
-    args.ifindex = ifindex;
+    struct sniffer_args wan_sniffer_args = {
+        .allowlist_fd = allowlist_fd,
+        .blocklist_fd = blocklist_fd,
+        .tracker_fd = tracker_fd,
+        .ifindex = ifaces.wan_ifindex,
+    };
+    struct sniffer_args lan_sniffer_args = {
+        .allowlist_fd = allowlist_fd,
+        .blocklist_fd = blocklist_fd,
+        .tracker_fd = tracker_fd,
+        .ifindex = ifaces.lan_ifindex,
+    };
 
-    pthread_t sniffer_thread;
-    if (pthread_create(&sniffer_thread, NULL, slow_path_sniffer, &args) != 0) {
-        fprintf(stderr, "Failed to create slow-path thread\n");
+    pthread_t wan_sniffer_thread, lan_sniffer_thread;
+    if (start_sniffer_thread(&wan_sniffer_thread, &wan_sniffer_args) ||
+        start_sniffer_thread(&lan_sniffer_thread, &lan_sniffer_args)) {
         return 1;
     }
 
     load_blocklist_from_csv(blocklist_fd);
 
     // --- REBUILD STATIC THREAT INTEL ---
-    // static_blocklist is fresh on every restart (the pin just points at whatever
-    // ips_bpf__load() created this run), and it's never written to blocklist.csv, so
-    // threats.txt is its only durable source. Re-run the injection here instead of requiring
-    // an operator to rerun ips_injector by hand after every restart; ips_injector remains
-    // available for hot-updating the live map while the daemon keeps running.
+
     inject_threat_intel(THREATS_INTEL_FILE, static_blocklist_fd);
+
     // Anchors the periodic re-check below so it doesn't immediately re-run at t=0.
     uint64_t last_static_refresh = (uint64_t)time(NULL);
 
@@ -740,7 +859,8 @@ int main(int argc, char **argv) {
     }
 
     ring_buffer__free(rb);
-    bpf_link__destroy(link);
+    bpf_link__destroy(ifaces.wan_link);
+    bpf_link__destroy(ifaces.lan_link);
     ips_bpf__destroy(skel);
     return 0;
 }

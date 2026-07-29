@@ -9,3 +9,5 @@ target_link_libraries(ips_loader bpf elf z)
 add_executable(ips_injector injector.c threat_intel.c)
 target_compile_options(ips_injector PRIVATE -g)
 target_link_libraries(ips_injector bpf elf z)
+
+# TODO add check for required libraries and host system

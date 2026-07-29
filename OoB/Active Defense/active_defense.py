@@ -1,3 +1,8 @@
+# TODO: apply_tarpit() below is not called from any live packet loop yet -- nfq_loop.py
+# just accepts every packet without invoking it. Also missing per the spec: active TCP
+# RST injection for mid-session threats (where DNAT-to-honeypot can't safely apply
+# without dropping established TCP state).
+
 #Imortam componentele necesare din libraria Scapy
 
 from scapy.layers.inet import IP, TCP, UDP, ICMP

@@ -27,7 +27,6 @@
 #define BATCH_SIZE 1024 // can be 2048 as raspberry pi has 64kb l1 cache for data
 
 
-
 // Standard Ethernet protocol types
 #ifndef ETH_P_IP
 #define ETH_P_IP 0x0800

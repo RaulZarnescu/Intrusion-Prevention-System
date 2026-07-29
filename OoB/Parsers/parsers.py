@@ -1,3 +1,7 @@
+# TODO: extract_sni() below is a standalone prototype -- it's only ever exercised against
+# the hardcoded mock packet at the bottom of this file, not wired into any live traffic
+# path. Also missing per the spec: JA3/JA4 fingerprinting alongside SNI, and ECH/DoH
+# fallback handling via canary domains.
 from scapy.all import *
 from scapy.layers.inet import TCP, IP
 from scapy.layers.tls.extensions import TLS_Ext_ServerName, ServerName

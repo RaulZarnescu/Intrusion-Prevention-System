@@ -1,3 +1,8 @@
+# TODO: this file is currently just data schema (Event/Finding/VerdictReport) for typing
+# Zeek log lines -- there's no actual model here yet. Per the spec this "AI Engine" is
+# supposed to run Isolation Forest/Random Forest for anomaly scoring and a local SLM/LLM
+# (Llama-3 8B / Mistral-7B) for profiling and explainability. None of that inference code
+# exists yet, and nothing here is wired up to receive live events from the Pi.
 from __future__ import annotations
 
 from dataclasses import dataclass, field

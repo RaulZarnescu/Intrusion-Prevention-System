@@ -1,3 +1,6 @@
+# TODO: this just logs src/dst and always accepts -- no inspection or enforcement is
+# wired in. Needs to actually call the parsers (parsers.py) and model (model.py) to get
+# a verdict, and apply_tarpit() (active_defense.py) or a drop/reset when warranted.
 from netfilterqueue import NetfilterQueue
 from scapy.layers.inet import IP
 
