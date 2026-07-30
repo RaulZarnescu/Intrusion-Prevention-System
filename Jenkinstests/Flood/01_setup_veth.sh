@@ -1,27 +1,41 @@
 #!/usr/bin/env bash
-# Creates a local veth pair for the flood test.
-# VIC_IF is named enp0s8 on purpose - see README.txt.
+# Creates two local veth pairs for the flood test: one for WAN, one for LAN.
+# main.c now requires both wan_interface and lan_interface (read from
+# config.ini) to resolve and successfully attach XDP, or it exits - so a
+# single interface (the old enp0s8 setup) is no longer enough.
 set -euo pipefail
 
-VIC_IF="enp0s8"
-ATT_IF="veth-attacker"
-VIC_IP="10.200.0.1/24"
-ATT_IP="10.200.0.2/24"
+WAN_IF="test-wan"
+WAN_PEER="veth-attacker"
+WAN_IP="10.200.0.1/24"
+WAN_PEER_IP="10.200.0.2/24"
 
-if ip link show "$VIC_IF" &>/dev/null; then
-    echo "[*] $VIC_IF already exists (leftover from a previous run) - removing it first"
-    sudo ip link del "$VIC_IF"
-fi
+LAN_IF="test-lan"
+LAN_PEER="veth-lan-peer"
+LAN_IP="10.200.1.1/24"
+LAN_PEER_IP="10.200.1.2/24"
 
-echo "[*] Creating veth pair: $VIC_IF <-> $ATT_IF"
-sudo ip link add "$VIC_IF" type veth peer name "$ATT_IF"
+setup_pair() {
+    local vic_if="$1" att_if="$2" vic_ip="$3" att_ip="$4"
 
-sudo ip addr add "$VIC_IP" dev "$VIC_IF"
-sudo ip addr add "$ATT_IP" dev "$ATT_IF"
+    if ip link show "$vic_if" &>/dev/null; then
+        echo "[*] $vic_if already exists (leftover from a previous run) - removing it first"
+        sudo ip link del "$vic_if"
+    fi
 
-sudo ip link set "$VIC_IF" up
-sudo ip link set "$ATT_IF" up
+    echo "[*] Creating veth pair: $vic_if <-> $att_if"
+    sudo ip link add "$vic_if" type veth peer name "$att_if"
+    sudo ip addr add "$vic_ip" dev "$vic_if"
+    sudo ip addr add "$att_ip" dev "$att_if"
+    sudo ip link set "$vic_if" up
+    sudo ip link set "$att_if" up
+}
+
+setup_pair "$WAN_IF" "$WAN_PEER" "$WAN_IP" "$WAN_PEER_IP"
+setup_pair "$LAN_IF" "$LAN_PEER" "$LAN_IP" "$LAN_PEER_IP"
 
 echo "[+] Interfaces up:"
-ip -brief addr show "$VIC_IF"
-ip -brief addr show "$ATT_IF"
+ip -brief addr show "$WAN_IF"
+ip -brief addr show "$WAN_PEER"
+ip -brief addr show "$LAN_IF"
+ip -brief addr show "$LAN_PEER"

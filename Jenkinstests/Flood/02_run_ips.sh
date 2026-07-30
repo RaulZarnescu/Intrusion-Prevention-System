@@ -48,6 +48,26 @@ if ! mount | grep -q "on /sys/fs/bpf type bpf"; then
     sudo mount -t bpf bpf /sys/fs/bpf
 fi
 
+# main.c now requires wan_interface/lan_interface from config.ini (no more
+# hardcoded names) - point them at our test veth pair for this run only.
+# config.ini is a real, shared file (holds actual deployment NIC names), so
+# back it up first and restore it in 04_cleanup.sh. Only take the backup if
+# one doesn't already exist: if a previous run crashed after patching but
+# before restoring, config.ini.bak already holds the real original - copying
+# over it again here would overwrite that with the patched (wrong) version.
+CONFIG_INI="$REPO_ROOT/config/config.ini"
+CONFIG_BACKUP="$REPO_ROOT/config/config.ini.bak"
+if [ ! -f "$CONFIG_BACKUP" ]; then
+    cp "$CONFIG_INI" "$CONFIG_BACKUP"
+fi
+grep -v -E "^(wan_interface|lan_interface)[[:space:]]*=" "$CONFIG_BACKUP" > "$CONFIG_INI.tmp"
+{
+    cat "$CONFIG_INI.tmp"
+    echo "wan_interface = test-wan"
+    echo "lan_interface = test-lan"
+} > "$CONFIG_INI"
+rm -f "$CONFIG_INI.tmp"
+
 # main.c resolves data/config paths as "../data", "../config/config.ini"
 # relative to the CURRENT WORKING DIRECTORY, so it must be launched with
 # fast_path/ as cwd regardless of where the binary itself lives.
