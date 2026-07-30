@@ -74,17 +74,29 @@ rm -f "$CONFIG_INI.tmp"
 cd "$REPO_ROOT/fast_path"
 
 echo "[*] Starting ips_loader (logging to $LOG_FILE)"
-# `sudo "$IPS_BIN" &` then `echo $!` is unreliable: sudo can fork internally,
-# so $! sometimes captures a wrapper process that exits right after handing
-# off to the real (differently-PID'd) ips_loader - making a perfectly healthy
-# daemon look dead. Instead, have the privileged shell write its OWN pid
-# before exec-ing into the binary - exec keeps the same PID, so this is
-# guaranteed to be the actual running process, not a wrapper around it.
+# PID-based liveness checks (both `sudo CMD &; echo $!` and writing $$ from
+# inside a `sudo bash -c "...; exec ..."`) have both proven unreliable in
+# this container - ips_loader is demonstrably running fine (full startup,
+# XDP attached, event loop active) while `kill -0` on the recorded PID still
+# reports it as dead, for reasons not worth chasing further. Check the log
+# content instead: it's what we actually care about ("did it start
+# successfully"), and sidesteps the PID/sudo uncertainty entirely.
 sudo bash -c "echo \$\$ > '$PID_FILE'; exec '$IPS_BIN'" > "$LOG_FILE" 2>&1 &
 
-sleep 2
-if [ ! -f "$PID_FILE" ] || ! sudo kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    echo "[!] ips_loader exited immediately - check $LOG_FILE"
+STARTED=0
+for i in $(seq 1 10); do
+    if grep -q "XDP is active" "$LOG_FILE" 2>/dev/null; then
+        STARTED=1
+        break
+    fi
+    if grep -q "FATAL" "$LOG_FILE" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+
+if [ "$STARTED" -ne 1 ]; then
+    echo "[!] ips_loader did not report successful startup within 10s - check $LOG_FILE"
     exit 1
 fi
 
