@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM debian:bookworm-slim
 
 # Runtime-only deps for the flood test: `ip` command, Python+scapy for the
 # flood, and the shared libs ips_loader is dynamically linked against

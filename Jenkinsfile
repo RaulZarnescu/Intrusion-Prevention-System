@@ -31,15 +31,14 @@ pipeline {
 		sh 'docker build -t ips-flood-test -f Jenkinstests/Flood/Dockerfile .'
 		sh '''
 		    docker run --rm --privileged --network host \
-		        -v "$WORKSPACE":/workspace \
-		        -e IPS_REPO_ROOT=/workspace \
+		        -v jenkins_home:/var/jenkins_home \
+		        -e IPS_REPO_ROOT="$WORKSPACE" \
 		        ips-flood-test \
-		        bash -c "cd /workspace/Jenkinstests/Flood && chmod +x *.sh *.py && ./01_setup_veth.sh && ./02_run_ips.sh && python3 03_flood_test.py --blocklist-csv /workspace/data/blocklist.csv && ./04_cleanup.sh"
+		        bash -c "cd \\"$WORKSPACE/Jenkinstests/Flood\\" && chmod +x *.sh *.py && ./01_setup_veth.sh && ./02_run_ips.sh && python3 03_flood_test.py --blocklist-csv \\"$WORKSPACE/data/blocklist.csv\\" && ./04_cleanup.sh"
 		'''
 	    }
 	}
-
-
+	
         stage('Archive') {
             steps {
                 archiveArtifacts artifacts: 'build/fast_path/ips_loader, build/fast_path/ips_injector', fingerprint: true
