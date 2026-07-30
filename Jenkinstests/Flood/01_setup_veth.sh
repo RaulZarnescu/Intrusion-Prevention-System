@@ -9,8 +9,8 @@ VIC_IP="10.200.0.1/24"
 ATT_IP="10.200.0.2/24"
 
 if ip link show "$VIC_IF" &>/dev/null; then
-    echo "[!] $VIC_IF already exists - run 04_cleanup.sh first."
-    exit 1
+    echo "[*] $VIC_IF already exists (leftover from a previous run) - removing it first"
+    sudo ip link del "$VIC_IF"
 fi
 
 echo "[*] Creating veth pair: $VIC_IF <-> $ATT_IF"
