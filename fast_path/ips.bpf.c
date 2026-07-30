@@ -45,7 +45,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, struct flow_key);
-    __type(value, __u8);
+    __type(value, struct ips_allowlist_data);
     __uint(max_entries, 131072);
 } allowlist SEC(".maps");
 
@@ -198,8 +198,8 @@ int fast_path_parser(struct xdp_md *ctx) {
     // ====================================================
     // STAGE 3: ALLOWLIST
     // ====================================================
-    action_flag = bpf_map_lookup_elem(&allowlist, &current_flow);
-    if (action_flag && *action_flag == 1) {
+    struct ips_allowlist_data *allow_entry = bpf_map_lookup_elem(&allowlist, &current_flow);
+    if (allow_entry) {
         return XDP_PASS;
     }
 

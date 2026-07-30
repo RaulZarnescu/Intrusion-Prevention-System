@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <errno.h>
 #include <unistd.h>
 #include <net/if.h>
 #include <bpf/libbpf.h>
@@ -32,7 +33,7 @@ struct sniffer_args {
 
 //------------------------------- Functions -----------------------------------------------------
 
-bool parse_long(const char *str, long *out_val) {
+static bool parse_long(const char *str, long *out_val) {
     char *endptr;
     errno = 0;
 
@@ -56,18 +57,20 @@ bool parse_long(const char *str, long *out_val) {
 
 // Copies an interface name from config.ini into a fixed-size ips_config field, truncating
 // to fit, and logs it under the given label ("WAN"/"LAN").
-void set_interface_config_field(char *dest, size_t dest_size, const char *value, const char *label) {
+static void set_interface_config_field(char *dest, size_t dest_size, const char *value, const char *label) {
     strncpy(dest, value, dest_size - 1);
     dest[dest_size - 1] = '\0';
     fprintf(stdout, "%s Interface: %s\n", label, dest);
 }
 
-void load_config(const char *filename, struct ips_config *config) {
+static void load_config(const char *filename, struct ips_config *config) {
     config->ban_duration_sec = 3600;
     config->token_bucket_max = 50;
     config->token_refill_rate = 10;
     config->max_tolerated_drops = 15;
     config->threat_intel_refresh_sec = 86400;
+    config->allowlist_ttl_sec = 900;
+    config->state_dump_interval_sec = 5;
     config->wan_interface[0] = '\0';
     config->lan_interface[0] = '\0';
 
@@ -123,13 +126,31 @@ void load_config(const char *filename, struct ips_config *config) {
                 config->threat_intel_refresh_sec = (unsigned int)parsed_val;
                 fprintf(stdout, "Threat Intel Refresh: %u seconds\n", config->threat_intel_refresh_sec);
             }
+            else if (strcmp(key, "allowlist_ttl_seconds") == 0) {
+                config->allowlist_ttl_sec = (unsigned int)parsed_val;
+                fprintf(stdout, "Allowlist TTL: %u seconds\n", config->allowlist_ttl_sec);
+            }
+            else if (strcmp(key, "state_dump_interval_seconds") == 0) {
+                config->state_dump_interval_sec = (unsigned int)parsed_val;
+                fprintf(stdout, "State Dump Interval: %u seconds\n", config->state_dump_interval_sec);
+            }
         }
     }
     fclose(file);
+
+    // A stale-but-unpurged allowlist entry can only outlive an unban if it survives at
+    // least as long as the ban itself -- keeping the TTL shorter guarantees a formerly-
+    // banned IP's old trust has already decayed by the time it would matter again.
+    if (config->allowlist_ttl_sec >= config->ban_duration_sec) {
+        fprintf(stderr, "[!] WARNING: allowlist_ttl_seconds (%u) >= ban_duration_seconds (%u) -- "
+                         "a flow could regain trust before a ban on the same IP would even expire.\n",
+                config->allowlist_ttl_sec, config->ban_duration_sec);
+    }
+
     printf("[+] Configuration loaded successfully.\n");
 }
 
-void load_blocklist_from_csv(int blocklist_fd) {
+static void load_blocklist_from_csv(int blocklist_fd) {
     FILE *fp = fopen(CSV_FILE, "r");
     if (!fp) {
         printf("[i] No existing blocklist.csv found. Starting fresh.\n");
@@ -198,7 +219,7 @@ static void fmt_flag_row(FILE *fp, const void *key, const void *value) {
     fprintf(fp, "%s,%u\n", inet_ntoa(addr), *v);
 }
 
-void save_batch_map_to_csv(int fd, const char *temp_file, const char *final_file,
+static void save_batch_map_to_csv(int fd, const char *temp_file, const char *final_file,
                             size_t key_size, size_t value_size, csv_formatter_fn fmt,
                             csv_filter_fn filter) {
     FILE *fp = fopen(temp_file, "w");
@@ -242,7 +263,7 @@ void save_batch_map_to_csv(int fd, const char *temp_file, const char *final_file
     rename(temp_file, final_file); 
 }
 
-void save_blocklist_to_csv(int blocklist_fd) {
+static void save_blocklist_to_csv(int blocklist_fd) {
     // No filter needed: blocklist is now structurally dynamic-only (static entries
     // live in the separate static_blocklist map), so nothing here needs excluding.
     save_batch_map_to_csv(blocklist_fd, CSV_TEMP, CSV_FILE,
@@ -250,39 +271,39 @@ void save_blocklist_to_csv(int blocklist_fd) {
                            fmt_blocklist_row, NULL);
 }
 
-void save_tracker_to_csv(int tracker_fd) {
+static void save_tracker_to_csv(int tracker_fd) {
     save_batch_map_to_csv(tracker_fd, TRACKER_CSV_TEMP, TRACKER_CSV_FILE,
                            sizeof(__u32), sizeof(struct ips_token_bucket), fmt_tracker_row, NULL);
 }
 
-void save_simple_map_to_csv(int fd, const char *temp_file, const char *final_file) {
+static void save_simple_map_to_csv(int fd, const char *temp_file, const char *final_file) {
     save_batch_map_to_csv(fd, temp_file, final_file, sizeof(__u32), sizeof(__u8), fmt_flag_row, NULL);
 }
 
 // ------------------------------------------------------------------------------------------------------------
 // Dedicated CSV Exporter for 5-Tuple Allowlist
 // ------------------------------------------------------------------------------------------------------------
-void save_allowlist_to_csv(int fd, const char *temp_file, const char *final_file) {
+static void save_allowlist_to_csv(int fd, const char *temp_file, const char *final_file) {
     FILE *fp = fopen(temp_file, "w");
     if (!fp) return;
 
     struct flow_key prev_key = {0};
     struct flow_key next_key;
-    __u8 value;
+    struct ips_allowlist_data value;
 
     while (bpf_map_get_next_key(fd, &prev_key, &next_key) == 0) {
         bpf_map_lookup_elem(fd, &next_key, &value);
-        
+
         char src_str[INET_ADDRSTRLEN];
         char dst_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &next_key.source_ip, src_str, INET_ADDRSTRLEN);
         inet_ntop(AF_INET, &next_key.dest_ip, dst_str, INET_ADDRSTRLEN);
-        
-        fprintf(fp, "%s,%s,%u,%u,%u\n", 
-                src_str, dst_str, 
-                ntohs(next_key.source_port), ntohs(next_key.dest_port), 
-                next_key.protocol);
-        
+
+        fprintf(fp, "%s,%s,%u,%u,%u,%llu\n",
+                src_str, dst_str,
+                ntohs(next_key.source_port), ntohs(next_key.dest_port),
+                next_key.protocol, (unsigned long long)value.last_seen);
+
         prev_key = next_key;
     }
     
@@ -315,7 +336,7 @@ static const char *ban_reason_to_str(__u32 reason) {
     }
 }
 
-int handle_ban_event(void *ctx, void *data, size_t data_sz) {
+static int handle_ban_event(void *ctx, void *data, size_t data_sz) {
     int blocklist_fd = *(int *)ctx;
     const struct ips_ban_event *event = data;
 
@@ -357,7 +378,7 @@ struct grey_ip greylist_tracker[GREYLIST_MAX] = {0};
 // egresses the other), so concurrent probes into this hand-rolled table need a lock.
 pthread_mutex_t greylist_lock = PTHREAD_MUTEX_INITIALIZER;
 
-int track_and_check_greylist(__u32 src_ip, int mark_authorized) {
+static int track_and_check_greylist(__u32 src_ip, int mark_authorized) {
     uint32_t idx = src_ip % GREYLIST_MAX;
     int result = 0;
 
@@ -409,7 +430,7 @@ int track_and_check_greylist(__u32 src_ip, int mark_authorized) {
 // file). IPv6 needs handling too, likely via Scapy here since eBPF can't cheaply do
 // variable-length extension header parsing for the general case.
 // ------------------------------------------------------------------------------------------------------------
-void *slow_path_sniffer(void *arg) {
+static void *slow_path_sniffer(void *arg) { // TODO: Streamline it
     struct sniffer_args *fds = (struct sniffer_args *)arg;
     
     int raw_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
@@ -492,8 +513,8 @@ void *slow_path_sniffer(void *arg) {
                     bpf_map_delete_elem(fds->tracker_fd, &src_ip);
                 }
 
-                __u8 trust_flag = 1;
-                bpf_map_update_elem(fds->allowlist_fd, &current_flow, &trust_flag, BPF_ANY);
+                struct ips_allowlist_data trust = { .last_seen = (uint64_t)time(NULL) };
+                bpf_map_update_elem(fds->allowlist_fd, &current_flow, &trust, BPF_ANY);
 
                 struct flow_key reverse_flow = current_flow;
                 reverse_flow.source_ip = current_flow.dest_ip;
@@ -501,7 +522,7 @@ void *slow_path_sniffer(void *arg) {
                 reverse_flow.source_port = current_flow.dest_port;
                 reverse_flow.dest_port = current_flow.source_port;
 
-                bpf_map_update_elem(fds->allowlist_fd, &reverse_flow, &trust_flag, BPF_ANY);
+                bpf_map_update_elem(fds->allowlist_fd, &reverse_flow, &trust, BPF_ANY);
             }
         }
         else if (ip->protocol == IPPROTO_UDP) {
@@ -523,8 +544,8 @@ void *slow_path_sniffer(void *arg) {
                     bpf_map_delete_elem(fds->tracker_fd, &src_ip);
                 }
 
-                __u8 trust_flag = 1;
-                bpf_map_update_elem(fds->allowlist_fd, &current_flow, &trust_flag, BPF_ANY);
+                struct ips_allowlist_data trust = { .last_seen = (uint64_t)time(NULL) };
+                bpf_map_update_elem(fds->allowlist_fd, &current_flow, &trust, BPF_ANY);
 
                 struct flow_key reverse_flow = current_flow;
                 reverse_flow.source_ip = current_flow.dest_ip;
@@ -532,7 +553,7 @@ void *slow_path_sniffer(void *arg) {
                 reverse_flow.source_port = current_flow.dest_port;
                 reverse_flow.dest_port = current_flow.source_port;
 
-                bpf_map_update_elem(fds->allowlist_fd, &reverse_flow, &trust_flag, BPF_ANY);
+                bpf_map_update_elem(fds->allowlist_fd, &reverse_flow, &trust, BPF_ANY);
             }
         }
     }
@@ -540,7 +561,7 @@ void *slow_path_sniffer(void *arg) {
     return NULL;
 }
 
-int load_skeleton(struct ips_bpf *skel, struct ips_config *config){
+static int load_skeleton(struct ips_bpf *skel, struct ips_config *config){
     load_config(CONFIG_FILE_PATH, config);
 
     if (!skel) { //check pointer
@@ -567,7 +588,7 @@ int load_skeleton(struct ips_bpf *skel, struct ips_config *config){
 // "not found" value) on any failure, so callers can just check `== 0` without a separate
 // error path -- fed by config, never a hardcoded guess, so an operator gets a clear error
 // instead of the daemon silently attaching to the wrong NIC.
-unsigned int resolve_interface(const char *name) {
+static unsigned int resolve_interface(const char *name) {
     if (!name || name[0] == '\0') {
         fprintf(stderr, "[!] FATAL: No interface configured.\n");
         return 0;
@@ -581,7 +602,8 @@ unsigned int resolve_interface(const char *name) {
     return ifindex;
 }
 
-int start_sniffer_thread(pthread_t *thread, struct sniffer_args *args) {
+
+static int start_sniffer_thread(pthread_t *thread, struct sniffer_args *args) {
     if (pthread_create(thread, NULL, slow_path_sniffer, args) != 0) {
         fprintf(stderr, "[!] Failed to create slow-path thread for ifindex %d\n", args->ifindex);
         return 1;
@@ -629,7 +651,7 @@ struct network_interfaces setup_network_interfaces(struct ips_bpf *skel, const s
     return ifaces;
 }
 
-int pin_bpf_map(struct bpf_map *map, const char *pin_path) {
+static int pin_bpf_map(struct bpf_map *map, const char *pin_path) {
     // BPF filesystem define
     bpf_map__unpin(map, pin_path); //unpin in case we had a crash and it remained unpinned
 
@@ -642,184 +664,137 @@ int pin_bpf_map(struct bpf_map *map, const char *pin_path) {
     return 0;
 }
 
-//------------------------------------------------------------------------------------------------------------
-// MAIN
-//------------------------------------------------------------------------------------------------------------
-int main(int argc, char **argv) {
-    setbuf(stdout, NULL);   //disables buffering on stdout, writes straight in the file descriptor immediately, instead of accumulating in a buffer.
-                            //stderr is already unbuffered from the lib
-    int err;
+static void allowlist_reconciliation(int allowlist_fd, int blocklist_fd, int static_blocklist_fd) {
+    struct flow_key keys[BATCH_SIZE];
+    struct ips_allowlist_data values[BATCH_SIZE];
+    struct flow_key expired[BATCH_SIZE];
 
-    struct ips_bpf *skel = ips_bpf__open();
-    struct ips_config current_config;
-
-    if (load_skeleton(skel, &current_config)) { //it also runs the config
-        return 1;
-    }
-
-    if (pin_bpf_map(skel->maps.static_blocklist, STATIC_BLOCKLIST_PIN_PATH)) { //pin blacklist map for injection
-        return 1;
-    }
-
-    struct network_interfaces ifaces = setup_network_interfaces(skel, &current_config);
-    if (!ifaces.wan_link || !ifaces.lan_link) {
-        return 1;
-    }
-
-    fprintf(stdout, "IPS Fast-Path successfully attached to %s and %s!\n", current_config.wan_interface, current_config.lan_interface);
-    fprintf(stdout, "XDP is active. Listening for traffic...\n");
-
-    int tracker_fd = bpf_map__fd(skel->maps.ip_tracker);
-    int blocklist_fd = bpf_map__fd(skel->maps.blocklist);               // dynamic bans (HASH)
-    int static_blocklist_fd = bpf_map__fd(skel->maps.static_blocklist); // threat-intel (LPM_TRIE)
-    int allowlist_fd = bpf_map__fd(skel->maps.allowlist);
-    int honeypot_fd = bpf_map__fd(skel->maps.honeypot_map);
-
-    if (mkdir(IPS_SAVE_DIR, 0755) == 0) {
-        printf("[i] Created new storage directory at %s\n", IPS_SAVE_DIR);
-    }
-
-    struct sniffer_args wan_sniffer_args = {
-        .allowlist_fd = allowlist_fd,
-        .blocklist_fd = blocklist_fd,
-        .tracker_fd = tracker_fd,
-        .ifindex = ifaces.wan_ifindex,
-    };
-    struct sniffer_args lan_sniffer_args = {
-        .allowlist_fd = allowlist_fd,
-        .blocklist_fd = blocklist_fd,
-        .tracker_fd = tracker_fd,
-        .ifindex = ifaces.lan_ifindex,
-    };
-
-    pthread_t wan_sniffer_thread, lan_sniffer_thread;
-    if (start_sniffer_thread(&wan_sniffer_thread, &wan_sniffer_args) ||
-        start_sniffer_thread(&lan_sniffer_thread, &lan_sniffer_args)) {
-        return 1;
-    }
-
-    load_blocklist_from_csv(blocklist_fd);
-
-    // --- REBUILD STATIC THREAT INTEL ---
-
-    inject_threat_intel(THREATS_INTEL_FILE, static_blocklist_fd);
-
-    // Anchors the periodic re-check below so it doesn't immediately re-run at t=0.
-    uint64_t last_static_refresh = (uint64_t)time(NULL);
-
-    // --- SETUP RING BUFFER ---
-    struct ring_buffer *rb = NULL;
-    rb = ring_buffer__new(bpf_map__fd(skel->maps.ban_events), handle_ban_event, &blocklist_fd, NULL);
-    if (!rb) {
-        fprintf(stderr, "[!] Failed to create ring buffer\n");
-        return 1;
-    }
-
-    printf("--- System Status: Event-Driven Mode Active ---\n");
+    __u32 batch_token;
+    void *in_batch = NULL;
+    void *out_batch = &batch_token;
+    __u32 count;
+    int err = 0;
 
     while (1) {
-        int err = ring_buffer__poll(rb, 1000);
-        if (err < 0) {
-            fprintf(stderr, "[!] Error polling ring buffer: %d\n", err);
-            break;
-        }
+        count = BATCH_SIZE;
+        err = bpf_map_lookup_batch(allowlist_fd, in_batch, out_batch, keys, values, &count, NULL);
 
-        bool blacklist_map_changed = 0;
-
-        uint64_t current_time = (uint64_t)time(NULL);
-
-        // ====================================================================
-        // ALLOWLIST/BLOCKLIST RECONCILIATION
-        // ====================================================================
-        // A flow can get allowlisted by the slow-path sniffer and later have its
-        // source IP banned (dynamic or static) through an unrelated path. Purge any
-        // allowlist entry whose source IP is now blocked so the fast-path's
-        // allowlist check (STAGE 3) can't bypass a ban made after the fact.
-        struct flow_key al_prev = {0}, al_next;
-        struct flow_key expired_allowlist_flows[BATCH_SIZE];
-        int allowlist_purge_count = 0;
-
-        while (bpf_map_get_next_key(allowlist_fd, &al_prev, &al_next) == 0) {
+        __u32 expired_count = 0;
+        for (__u32 i = 0; i < count; i++) {
             struct ips_blocklist_data dummy_val;
-            struct lpm_ip_key static_lookup_key = { .prefixlen = 32, .ip = al_next.source_ip };
+            struct lpm_ip_key static_lookup_key = { .prefixlen = 32, .ip = keys[i].source_ip };
 
             bool is_blocked =
-                bpf_map_lookup_elem(blocklist_fd, &al_next.source_ip, &dummy_val) == 0 ||
+                bpf_map_lookup_elem(blocklist_fd, &keys[i].source_ip, &dummy_val) == 0 ||
                 bpf_map_lookup_elem(static_blocklist_fd, &static_lookup_key, &dummy_val) == 0;
 
-            if (is_blocked && allowlist_purge_count < BATCH_SIZE) {
-                expired_allowlist_flows[allowlist_purge_count++] = al_next;
+            if (is_blocked) {
+                expired[expired_count++] = keys[i];
             }
-            al_prev = al_next;
         }
 
-        for (int i = 0; i < allowlist_purge_count; i++) {
-            bpf_map_delete_elem(allowlist_fd, &expired_allowlist_flows[i]);
+        if (expired_count > 0) {
+            bpf_map_delete_batch(allowlist_fd, expired, &expired_count, NULL);
         }
 
-        // ====================================================================
-        // AGING (Dynamic Blocklist Eviction)
-        // ====================================================================
-        // blocklist is now the dynamic-only HASH map, so this walk never has to wade
-        // through threat-intel entries just to skip them -- every key it visits is
-        // always eligible for aging.
+        if (err != 0) break;
+        in_batch = &batch_token;
+    }
+}
 
-        // bl_key starts at 0 as a "doesn't exist yet" sentinel, same convention a HASH
-        // map's first bpf_map_get_next_key() call expects. Deletions are collected and
-        // applied only after the walk finishes, since deleting mid-walk is fragile.
-        __u32 bl_key = 0, bl_next_key;
-        struct ips_blocklist_data bl_value;
+static void age_allowlist_map(int allowlist_fd, const struct ips_config *config, uint64_t current_time) {
+    struct flow_key keys[BATCH_SIZE];
+    struct ips_allowlist_data values[BATCH_SIZE];
+    struct flow_key expired[BATCH_SIZE];
 
-        __u32 expired_keys[BATCH_SIZE];
-        int expired_count = 0;
+    __u32 batch_token;
+    void *in_batch = NULL;
+    void *out_batch = &batch_token;
+    __u32 count;
+    int err = 0;
 
-        while (bpf_map_get_next_key(blocklist_fd, &bl_key, &bl_next_key) == 0) {
-            bpf_map_lookup_elem(blocklist_fd, &bl_next_key, &bl_value);
+    while (1) {
+        count = BATCH_SIZE;
+        err = bpf_map_lookup_batch(allowlist_fd, in_batch, out_batch, keys, values, &count, NULL);
 
-            if (bl_value.ban_timestamp == 0) {
+        __u32 expired_count = 0;
+        for (__u32 i = 0; i < count; i++) {
+            if ((current_time - values[i].last_seen) > config->allowlist_ttl_sec) {
+                expired[expired_count++] = keys[i];
+            }
+        }
+
+        if (expired_count > 0) {
+            bpf_map_delete_batch(allowlist_fd, expired, &expired_count, NULL);
+        }
+
+        if (err != 0) break;
+        in_batch = &batch_token;
+    }
+}
+
+static void age_blocklist_map(int blocklist_fd, const struct ips_config *config, uint64_t current_time) {
+    bool blacklist_map_changed = false;
+
+    __u32 keys[BATCH_SIZE];
+    struct ips_blocklist_data values[BATCH_SIZE];
+    __u32 expired[BATCH_SIZE];
+
+    __u32 batch_token;
+    void *in_batch = NULL;
+    void *out_batch = &batch_token;
+    __u32 count;
+    int err = 0;
+
+    while (1) {
+        count = BATCH_SIZE;
+        err = bpf_map_lookup_batch(blocklist_fd, in_batch, out_batch, keys, values, &count, NULL);
+
+        __u32 expired_count = 0;
+        for (__u32 i = 0; i < count; i++) {
+            if (values[i].ban_timestamp == 0) {
                 // meaning pending fixup with current time
                 // TODO: maybe an handling,
                 // although idk this is usually a breaking point only if the IPS is under attack, that's why i added an if to not unban a timestamp of 0
+                continue;
             }
-            else if ((current_time - bl_value.ban_timestamp) > current_config.ban_duration_sec) {
-                if (expired_count < BATCH_SIZE) {
-                    expired_keys[expired_count++] = bl_next_key;
-                }
+            if ((current_time - values[i].ban_timestamp) > config->ban_duration_sec) {
+                expired[expired_count++] = keys[i];
             }
-            bl_key = bl_next_key;
         }
 
-        for (int i = 0; i < expired_count; i++) {
-            struct in_addr unban_ip;
-            unban_ip.s_addr = expired_keys[i];
-
-            bpf_map_delete_elem(blocklist_fd, &expired_keys[i]);
-            printf("[i] AGING: IP %s has served its time. Unbanned.\n", inet_ntoa(unban_ip));
-
-            blacklist_map_changed = 1; 
+        if (expired_count > 0) {
+            for (__u32 i = 0; i < expired_count; i++) {
+                struct in_addr unban_ip;
+                unban_ip.s_addr = expired[i];
+                printf("[i] AGING: IP %s has served its time. Unbanned.\n", inet_ntoa(unban_ip));
+            }
+            __u32 del_count = expired_count;
+            bpf_map_delete_batch(blocklist_fd, expired, &del_count, NULL);
+            blacklist_map_changed = true;
         }
 
-        if (blacklist_map_changed) {
-            save_blocklist_to_csv(blocklist_fd);
-            printf("[i] Blocklist saved to disk.\n");
-        }
-        // ====================================================================
-        // STATIC THREAT INTEL: periodic re-injection + TTL sweep
-        // ====================================================================
-        // Runs at most once per threat_intel_refresh_sec (default 24h), so this is the
-        // only place static_blocklist gets walked in full -- keeping it off the 1/sec
-        // dynamic aging path is the whole point of having split the two maps.
-        if ((current_time - last_static_refresh) >= current_config.threat_intel_refresh_sec) {
+        if (err != 0) break;
+        in_batch = &batch_token;
+    }
+
+    if (blacklist_map_changed) {
+        save_blocklist_to_csv(blocklist_fd);
+        printf("[i] Blocklist saved to disk.\n");
+    }
+}
+
+
+static void inject_threat_info_periodically( int static_blocklist_fd, const struct ips_config *config, uint64_t current_time, uint64_t *last_static_refresh) {
+
+        if ((current_time - *last_static_refresh) >= config->threat_intel_refresh_sec) {
             // Re-run threats.txt: a pure upsert, so entries still present just get their
             // ban_timestamp refreshed to "now". Entries no longer in the file simply stop
             // being refreshed and fall behind, which is what the sweep below acts on.
             inject_threat_intel(THREATS_INTEL_FILE, static_blocklist_fd);
 
-            // Entries that missed a refresh cycle (delisted from the feed, or the feed/
-            // download failed) age out here instead of staying blocked forever. The TTL is
-            // a multiple of the refresh interval so one missed/late pull doesn't unban
-            // something that's still legitimately on the list.
-            uint64_t static_ttl = 2ULL * current_config.threat_intel_refresh_sec;
+            // Entries that missed two refreshes, are aged
+            uint64_t static_ttl = 2ULL * config->threat_intel_refresh_sec;
 
             struct lpm_ip_key st_key = { .prefixlen = 32, .ip = 0 }, st_next_key;
             struct ips_blocklist_data st_value;
@@ -845,22 +820,156 @@ int main(int argc, char **argv) {
                        inet_ntoa(unban_ip), expired_static_keys[i].prefixlen);
             }
 
-            last_static_refresh = current_time;
+            *last_static_refresh = current_time;
         }
+}
 
-        // Dump the other maps for the monitoring TUI. Unlike the blocklist, these maps
-        // (especially ip_tracker) can change on nearly every packet with no ring-buffer
-        // event to key off of, so there's no cheap way to know "did it change" from
-        // user-space. Just dump them every poll iteration instead -- the ring buffer poll
-        // above already bounds this loop to ~1/sec when idle, same cadence as the aging check.
+static void state_dump(int tracker_fd, int allowlist_fd, int honeypot_fd, const struct ips_config *config, uint64_t current_time, uint64_t *last_state_dump) {
+    if ((current_time - *last_state_dump) >= config->state_dump_interval_sec) {
         save_tracker_to_csv(tracker_fd);
         save_allowlist_to_csv(allowlist_fd, ALLOWLIST_CSV_TEMP, ALLOWLIST_CSV_FILE);
         save_simple_map_to_csv(honeypot_fd, HONEYPOT_CSV_TEMP, HONEYPOT_CSV_FILE);
+        *last_state_dump = current_time;
+    }
+}
+
+//------------------------------------------------------------------------------------------------------------
+// MAIN
+//------------------------------------------------------------------------------------------------------------
+#define EXIT_SKELETON_FAILED       2 // ips_bpf__open()/ips_bpf__load() failed
+#define EXIT_MAP_PIN_FAILED        3 // bpf_map__pin() on static_blocklist failed
+#define EXIT_IFACE_SETUP_FAILED    4 // interface resolution or XDP attach failed for WAN and/or LAN
+#define EXIT_SNIFFER_THREAD_FAILED 5 // pthread_create() failed for the WAN and/or LAN slow-path thread
+#define EXIT_RINGBUF_FAILED        6 // ring_buffer__new() failed
+#define EXIT_RINGBUF_POLL_FAILED   7 // ring_buffer__poll() failed inside the main event loop
+#define EXIT_SAVE_DIR_FAILED       8 // mkdir() on IPS_SAVE_DIR failed for a reason other than "already exists"
+
+// TODO: Place these defines into a dedicated file for codes. Also set the codes as per a law (like HTTP errors with those 4xx, 3xx type of errors)
+
+// TODO:   Remaining gaps from the earlier list, in case you want to keep going: the silent fopen/malloc/rename failures in save_batch_map_to_csv/save_allowlist_to_csv,
+// inet_aton not checked in load_blocklist_from_csv, handle_ban_event not checking bpf_map_update_elem, recvfrom in slow_path_sniffer failing silently,
+// and track_and_check_greylist's exhausted-probe-chain case logging nothing.
+
+
+int main(int argc, char **argv) {
+    setbuf(stdout, NULL);   //disables buffering on stdout, writes straight in the file descriptor immediately, instead of accumulating in a buffer.
+                            //stderr is already unbuffered from the lib
+    struct ips_bpf *skel = ips_bpf__open();
+    struct ips_config current_config;
+
+    if (load_skeleton(skel, &current_config)) { //it also runs the config
+        return EXIT_SKELETON_FAILED;
+    }
+
+    if (pin_bpf_map(skel->maps.static_blocklist, STATIC_BLOCKLIST_PIN_PATH)) { //pin blacklist map for injection
+        return EXIT_MAP_PIN_FAILED;
+    }
+
+    struct network_interfaces ifaces = setup_network_interfaces(skel, &current_config);
+    if (!ifaces.wan_link || !ifaces.lan_link) {
+        return EXIT_IFACE_SETUP_FAILED;
+    }
+
+    fprintf(stdout, "IPS Fast-Path successfully attached to %s and %s!\n", current_config.wan_interface, current_config.lan_interface);
+    fprintf(stdout, "XDP is active. Listening for traffic...\n");
+
+    int tracker_fd = bpf_map__fd(skel->maps.ip_tracker);
+    int blocklist_fd = bpf_map__fd(skel->maps.blocklist);               // dynamic bans (HASH)
+    int static_blocklist_fd = bpf_map__fd(skel->maps.static_blocklist); // threat-intel (LPM_TRIE)
+    int allowlist_fd = bpf_map__fd(skel->maps.allowlist);
+    int honeypot_fd = bpf_map__fd(skel->maps.honeypot_map);
+
+    if (mkdir(IPS_SAVE_DIR, 0755) == 0) {
+        printf("[i] Created new storage directory at %s\n", IPS_SAVE_DIR);
+    } else if (errno != EEXIST) {
+        // Every CSV write from here on targets a file inside IPS_SAVE_DIR, and fopen()
+        // failures on those are silent (see save_batch_map_to_csv/save_allowlist_to_csv) --
+        // catching it here, loudly, is the only place the real root cause would surface.
+        fprintf(stderr, "[!] FATAL: Failed to create storage directory %s: %s\n", IPS_SAVE_DIR, strerror(errno));
+        return EXIT_SAVE_DIR_FAILED;
+    }
+
+    struct sniffer_args wan_sniffer_args = {
+        .allowlist_fd = allowlist_fd,
+        .blocklist_fd = blocklist_fd,
+        .tracker_fd = tracker_fd,
+        .ifindex = ifaces.wan_ifindex,
+    };
+    struct sniffer_args lan_sniffer_args = {
+        .allowlist_fd = allowlist_fd,
+        .blocklist_fd = blocklist_fd,
+        .tracker_fd = tracker_fd,
+        .ifindex = ifaces.lan_ifindex,
+    };
+
+    pthread_t wan_sniffer_thread, lan_sniffer_thread;
+    if (start_sniffer_thread(&wan_sniffer_thread, &wan_sniffer_args) ||
+        start_sniffer_thread(&lan_sniffer_thread, &lan_sniffer_args)) {
+        return EXIT_SNIFFER_THREAD_FAILED;
+    }
+
+    load_blocklist_from_csv(blocklist_fd);
+
+    // --- REBUILD STATIC THREAT INTEL ---
+
+    inject_threat_intel(THREATS_INTEL_FILE, static_blocklist_fd);
+
+    // Anchors the periodic re-check below so it doesn't immediately re-run at t=0.
+    uint64_t last_static_refresh = (uint64_t)time(NULL);
+    uint64_t last_state_dump = (uint64_t)time(NULL);
+
+    // --- SETUP RING BUFFER ---
+    struct ring_buffer *rb = NULL;
+    rb = ring_buffer__new(bpf_map__fd(skel->maps.ban_events), handle_ban_event, &blocklist_fd, NULL);
+    if (!rb) {
+        fprintf(stderr, "[!] Failed to create ring buffer\n");
+        return EXIT_RINGBUF_FAILED;
+    }
+
+    printf("--- System Status: Event-Driven Mode Active ---\n");
+
+    int exit_code = 0;
+
+    while (1) {
+        int err = ring_buffer__poll(rb, 1000);
+        if (err < 0) {
+            fprintf(stderr, "[!] Error polling ring buffer: %d\n", err);
+            exit_code = EXIT_RINGBUF_POLL_FAILED;
+            break;
+        }
+
+        uint64_t current_time = (uint64_t)time(NULL);
+
+        // ====================================================================
+        // ALLOWLIST/BLOCKLIST RECONCILIATION
+        // ====================================================================
+
+        allowlist_reconciliation(allowlist_fd, blocklist_fd, static_blocklist_fd); //any blocklisted ip found in allowlist, is deleted from allowed list
+
+        // ====================================================================
+        // AGING (Dynamic Blocklist + Allowlist Eviction)
+        // ====================================================================
+
+        age_blocklist_map(blocklist_fd, &current_config, current_time); //aging logic for the blocklist map
+
+        age_allowlist_map(allowlist_fd, &current_config, current_time); //idle-flow eviction for the allowlist
+        
+        // ====================================================================
+        // STATIC THREAT INTEL: periodic re-injection + TTL sweep
+        // ====================================================================
+
+        inject_threat_info_periodically(static_blocklist_fd, &current_config, current_time, &last_static_refresh);
+
+        // ====================================================================
+        // STATE DUMP: tracker/allowlist/honeypot CSVs
+        // ====================================================================
+
+        state_dump(tracker_fd, allowlist_fd, honeypot_fd, &current_config, current_time, &last_state_dump); // run per interval given by config file
     }
 
     ring_buffer__free(rb);
     bpf_link__destroy(ifaces.wan_link);
     bpf_link__destroy(ifaces.lan_link);
     ips_bpf__destroy(skel);
-    return 0;
+    return exit_code;
 }

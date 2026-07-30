@@ -23,6 +23,13 @@ struct ips_blocklist_data {
     // is_static was made __64 from __8 to avoid padding
 };
 
+// Presence in the allowlist map means trusted; last_seen is refreshed on every packet
+// slow_path_sniffer() observes for an already-trusted flow, so age_allowlist_map() only
+// evicts flows that have genuinely gone idle, not ones still actively passing traffic.
+struct ips_allowlist_data {
+    __u64 last_seen;
+};
+
 // ==============================================================================
 // #REQ-XXX: Ring Buffer Event
 // ==============================================================================
@@ -64,6 +71,8 @@ struct ips_config {
     unsigned int token_refill_rate;
     unsigned int max_tolerated_drops;
     unsigned int threat_intel_refresh_sec; // How often to re-read threats.txt into static_blocklist
+    unsigned int allowlist_ttl_sec; // How long a trusted flow survives with no traffic before it's aged out
+    unsigned int state_dump_interval_sec; // How often the tracker/allowlist/honeypot CSVs are rewritten for monitor.py
     char wan_interface[16]; // matches IFNAMSIZ; upstream-facing physical interface (e.g. eth0)
     char lan_interface[16]; // matches IFNAMSIZ; internal-facing physical interface (e.g. eth1)
 };
