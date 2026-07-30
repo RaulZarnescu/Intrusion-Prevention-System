@@ -17,8 +17,14 @@ if [ ! -x "$IPS_BIN" ]; then
 fi
 
 if [ -f "$PID_FILE" ]; then
-    echo "[!] $PID_FILE already exists - is ips_loader already running? Run 04_cleanup.sh first if not."
-    exit 1
+    OLD_PID="$(cat "$PID_FILE")"
+    if sudo kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "[!] ips_loader already running (PID $OLD_PID) - run 04_cleanup.sh first."
+        exit 1
+    else
+        echo "[*] Stale PID file from a previous run (PID $OLD_PID not running) - removing it"
+        rm -f "$PID_FILE"
+    fi
 fi
 
 # Strip our test IPs from the persisted blocklist before starting - main.c's
@@ -34,14 +40,6 @@ if [ -f "$BLOCKLIST_CSV" ]; then
     grep -v -E "^(10\.200\.0\.66|10\.200\.0\.67)," "$BLOCKLIST_CSV" > "$BLOCKLIST_CSV.tmp" \
         && mv "$BLOCKLIST_CSV.tmp" "$BLOCKLIST_CSV"
 fi
-
-# main.c pins static_blocklist to /sys/fs/bpf/... - that path has to actually
-# be a mounted BPF filesystem, which a fresh container doesn't have by default.
-if ! mount | grep -q "on /sys/fs/bpf type bpf"; then
-    echo "[*] Mounting bpffs at /sys/fs/bpf"
-    mount -t bpf bpf /sys/fs/bpf
-fi
-
 
 # main.c resolves data/config paths as "../data", "../config/config.ini"
 # relative to the CURRENT WORKING DIRECTORY, so it must be launched with
