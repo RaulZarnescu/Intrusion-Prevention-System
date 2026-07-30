@@ -41,6 +41,13 @@ if [ -f "$BLOCKLIST_CSV" ]; then
         && mv "$BLOCKLIST_CSV.tmp" "$BLOCKLIST_CSV"
 fi
 
+# main.c pins static_blocklist to /sys/fs/bpf/... - that path has to actually
+# be a mounted BPF filesystem, which a fresh container doesn't have by default.
+if ! mount | grep -q "on /sys/fs/bpf type bpf"; then
+    echo "[*] Mounting bpffs at /sys/fs/bpf"
+    sudo mount -t bpf bpf /sys/fs/bpf
+fi
+
 # main.c resolves data/config paths as "../data", "../config/config.ini"
 # relative to the CURRENT WORKING DIRECTORY, so it must be launched with
 # fast_path/ as cwd regardless of where the binary itself lives.
