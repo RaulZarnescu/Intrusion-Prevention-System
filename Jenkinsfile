@@ -17,6 +17,15 @@ pipeline {
             }
         }
 
+	stage('Test') {
+	    steps {
+		sh '''
+		    python3 -m unittest discover -s Jenkinstests -v
+		'''
+	    }
+	}
+
+
         stage('Archive') {
             steps {
                 archiveArtifacts artifacts: 'build/fast_path/ips_loader, build/fast_path/ips_injector', fingerprint: true
