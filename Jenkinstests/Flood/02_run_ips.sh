@@ -74,11 +74,16 @@ rm -f "$CONFIG_INI.tmp"
 cd "$REPO_ROOT/fast_path"
 
 echo "[*] Starting ips_loader (logging to $LOG_FILE)"
-sudo "$IPS_BIN" > "$LOG_FILE" 2>&1 &
-echo $! > "$PID_FILE"
+# `sudo "$IPS_BIN" &` then `echo $!` is unreliable: sudo can fork internally,
+# so $! sometimes captures a wrapper process that exits right after handing
+# off to the real (differently-PID'd) ips_loader - making a perfectly healthy
+# daemon look dead. Instead, have the privileged shell write its OWN pid
+# before exec-ing into the binary - exec keeps the same PID, so this is
+# guaranteed to be the actual running process, not a wrapper around it.
+sudo bash -c "echo \$\$ > '$PID_FILE'; exec '$IPS_BIN'" > "$LOG_FILE" 2>&1 &
 
 sleep 2
-if ! sudo kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+if [ ! -f "$PID_FILE" ] || ! sudo kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     echo "[!] ips_loader exited immediately - check $LOG_FILE"
     exit 1
 fi
