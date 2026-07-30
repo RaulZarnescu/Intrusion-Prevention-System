@@ -5,7 +5,7 @@ FROM debian:bookworm-slim
 # (bpf/elf/z) - no compiler needed, the binary is already built by the
 # Jenkins "Build" stage before this image ever runs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    iproute2 python3 python3-pip sudo libbpf0 libelf1 zlib1g \
+    iproute2 python3 python3-pip sudo libbpf1 libelf1 zlib1g \
     && pip3 install --no-cache-dir scapy \
     && rm -rf /var/lib/apt/lists/*
 
