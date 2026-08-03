@@ -49,6 +49,24 @@ struct {
     __uint(max_entries, 131072);
 } allowlist SEC(".maps");
 
+// #REQ-XXX: Greylist bootstrap ("5 clean observations -> trust"), per source IP.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, __u32);
+    __type(value, struct ips_greylist_data);
+    __uint(max_entries, 65536);
+} greylist SEC(".maps");
+
+// Source IPs/subnets exempt from the greylist bootstrap, loaded once from config.ini's
+// excluded_source_ips at startup (main.c owns writes, same as static_blocklist/injector.c).
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __type(key, struct lpm_ip_key);
+    __type(value, __u8);
+    __uint(max_entries, MAX_EXCLUDED_SRCS);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} excluded_srcs SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 256 * 1024);
@@ -56,9 +74,16 @@ struct {
 
 volatile const __u32 burst_tokens = 50;
 volatile const __u32 max_tolerated_drops = 15;
-volatile const __u64 refill_interval_ns = 50000000ULL; 
+volatile const __u64 refill_interval_ns = 50000000ULL;
 
 //----------------------------------------------------------------------------------------------------------------------
+
+// syn+fin, null scan, fin+psh+urg -- single-packet, stateless, no reassembly needed.
+static __always_inline int is_malicious_tcp_flags(const struct tcphdr *tcp) {
+    return (tcp->syn && tcp->fin) ||
+           (!tcp->syn && !tcp->ack && !tcp->fin && !tcp->rst && !tcp->psh && !tcp->urg) ||
+           (tcp->fin && tcp->psh && tcp->urg);
+}
 
 SEC("xdp")
 int fast_path_parser(struct xdp_md *ctx) {
@@ -182,11 +207,25 @@ int fast_path_parser(struct xdp_md *ctx) {
         current_flow.source_port = tcp->source;
         current_flow.dest_port = tcp->dest;
 
-        // TODO: the malformed-flag check (syn+fin, null scan, fin+psh+urg) currently
-        // lives in user-space slow_path_sniffer() in main.c. It's a single-packet,
-        // stateless check with no reassembly needed -- a good candidate to move here
-        // as its own STAGE so it drops at line rate instead of relying on a raw-socket
-        // sniffer that only sees a copy after the fact and can miss packets under load.
+        // ====================================================
+        // STAGE 2.5: MALFORMED TCP FLAGS
+        // ====================================================
+        if (is_malicious_tcp_flags(tcp)) {
+            struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
+
+            if (bpf_map_update_elem(&blocklist, &src_ip, &block_data, BPF_ANY) == 0) {
+                bpf_map_delete_elem(&ip_tracker, &src_ip);
+
+                struct ips_ban_event *event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
+                if (event) {
+                    event->src_ip = src_ip;
+                    event->drop_count = 0;
+                    event->reason = IPS_BAN_REASON_MALFORMED_FLAGS;
+                    bpf_ringbuf_submit(event, 0);
+                }
+            }
+            return XDP_DROP;
+        }
     }
     else if (ip->protocol == IPPROTO_UDP) {
         struct udphdr *udp = (void *)((__u8 *)ip + ip_hdr_len);
@@ -217,8 +256,48 @@ int fast_path_parser(struct xdp_md *ctx) {
     }
 
     // ====================================================
-    // STAGE 5: SLOW-PATH (Default)
+    // STAGE 5: GREYLIST BOOTSTRAP ("5 clean observations -> trust")
+    // Only reachable for TCP/UDP (current_flow's ports are unset otherwise), on a flow that
+    // just missed the allowlist above. Ported from the old user-space slow_path_sniffer()/
+    // track_and_check_greylist() -- same semantics, now line-rate and lock-free (the counter
+    // uses __sync_fetch_and_add instead of a mutex, same pattern as bucket->drop_count above).
     // ====================================================
+    if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP) {
+        struct lpm_ip_key excl_key = { .prefixlen = 32, .ip = src_ip };
+        if (!bpf_map_lookup_elem(&excluded_srcs, &excl_key)) {
+            struct ips_greylist_data *grey = bpf_map_lookup_elem(&greylist, &src_ip);
+            int promote = 0;
+
+            if (!grey) {
+                struct ips_greylist_data new_grey = { .count = 1, .authorized = 0 };
+                bpf_map_update_elem(&greylist, &src_ip, &new_grey, BPF_ANY);
+            } else if (grey->authorized) {
+                // Already proven clean -- fast-track this (possibly new) flow without
+                // re-counting, even if its earlier allowlist entry aged out.
+                promote = 1;
+            } else {
+                __u32 new_count = __sync_fetch_and_add(&grey->count, 1) + 1;
+                if (new_count >= 5) {
+                    grey->authorized = 1;
+                    promote = 1;
+                    bpf_map_delete_elem(&ip_tracker, &src_ip);
+                }
+            }
+
+            if (promote) {
+                struct ips_allowlist_data trust = { .last_seen = bpf_ktime_get_ns() / 1000000000ULL };
+                bpf_map_update_elem(&allowlist, &current_flow, &trust, BPF_ANY);
+
+                struct flow_key reverse_flow = current_flow;
+                reverse_flow.source_ip = current_flow.dest_ip;
+                reverse_flow.dest_ip = current_flow.source_ip;
+                reverse_flow.source_port = current_flow.dest_port;
+                reverse_flow.dest_port = current_flow.source_port;
+                bpf_map_update_elem(&allowlist, &reverse_flow, &trust, BPF_ANY);
+            }
+        }
+    }
+
     return XDP_PASS;
 }
 

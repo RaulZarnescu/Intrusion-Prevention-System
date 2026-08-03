@@ -51,6 +51,41 @@ static void set_interface_config_field(char *dest, size_t dest_size, const char 
     fprintf(stdout, "%s Interface: %s\n", label, dest);
 }
 
+// Parses a comma-separated CIDR list (e.g. "192.168.56.103/32,127.0.0.0/8") into
+// config->excluded_srcs. Always resets the count first, so a config.ini value fully
+// replaces whatever default was set before it, rather than appending to it.
+static void parse_excluded_srcs(const char *value, struct ips_config *config) {
+    config->excluded_srcs_count = 0;
+
+    char buf[128];
+    strncpy(buf, value, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *saveptr;
+    char *tok = strtok_r(buf, ",", &saveptr);
+    while (tok && config->excluded_srcs_count < MAX_EXCLUDED_SRCS) {
+        char *slash = strchr(tok, '/');
+        unsigned int prefixlen = 32;
+        if (slash) {
+            *slash = '\0';
+            prefixlen = (unsigned int)atoi(slash + 1);
+        }
+
+        struct in_addr addr;
+        if (inet_aton(tok, &addr)) {
+            struct lpm_ip_key *entry = &config->excluded_srcs[config->excluded_srcs_count];
+            entry->ip = addr.s_addr;
+            entry->prefixlen = prefixlen;
+            config->excluded_srcs_count++;
+            fprintf(stdout, "Excluded source: %s/%u\n", tok, prefixlen);
+        } else {
+            fprintf(stderr, "[!] Invalid excluded_source_ips entry: %s\n", tok);
+        }
+
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+}
+
 static void load_config(const char *filename, struct ips_config *config) {
     config->ban_duration_sec = 3600;
     config->token_bucket_max = 50;
@@ -61,6 +96,10 @@ static void load_config(const char *filename, struct ips_config *config) {
     config->state_dump_interval_sec = 5;
     config->wan_interface[0] = '\0';
     config->lan_interface[0] = '\0';
+    // Default: the router's own bridged traffic reflecting back, plus loopback -- otherwise
+    // the greylist bootstrap in fast_path_parser() would trust flows that never actually
+    // crossed the monitored interface. Overridable via excluded_source_ips in config.ini.
+    parse_excluded_srcs("192.168.56.103/32,10.0.2.15/32,127.0.0.0/8", config);
 
     FILE *file = fopen(filename, "r");
     if (!file) {
@@ -81,6 +120,10 @@ static void load_config(const char *filename, struct ips_config *config) {
             }
             if (strcmp(key, "lan_interface") == 0) {
                 set_interface_config_field(config->lan_interface, sizeof(config->lan_interface), value, "LAN");
+                continue;
+            }
+            if (strcmp(key, "excluded_source_ips") == 0) {
+                parse_excluded_srcs(value, config);
                 continue;
             }
 
@@ -319,6 +362,7 @@ void append_blocklist_entry_to_csv(__u32 ip, const struct ips_blocklist_data *bl
 static const char *ban_reason_to_str(__u32 reason) {
     switch (reason) {
         case IPS_BAN_REASON_RATE_LIMIT: return "rate limit exceeded";
+        case IPS_BAN_REASON_MALFORMED_FLAGS: return "malformed TCP flags";
         default: return "unknown reason";
     }
 }
@@ -456,6 +500,23 @@ static int pin_bpf_map(struct bpf_map *map, const char *pin_path) {
     return 0;
 }
 
+// Pushes config->excluded_srcs (parsed from config.ini's excluded_source_ips) into the
+// excluded_srcs BPF map once at startup. Unlike static_blocklist there's no periodic
+// re-injection -- these are fixed deployment-topology addresses, not threat intel that
+// changes over time.
+static void load_excluded_srcs(int excluded_srcs_fd, const struct ips_config *config) {
+    __u8 dummy = 1;
+    for (unsigned int i = 0; i < config->excluded_srcs_count; i++) {
+        struct lpm_ip_key key = config->excluded_srcs[i];
+        if (bpf_map_update_elem(excluded_srcs_fd, &key, &dummy, BPF_ANY) != 0) {
+            struct in_addr addr;
+            addr.s_addr = key.ip;
+            fprintf(stderr, "[!] Failed to add excluded source %s/%u: %s\n",
+                    inet_ntoa(addr), key.prefixlen, strerror(errno));
+        }
+    }
+}
+
 static void allowlist_reconciliation(int allowlist_fd, int blocklist_fd, int static_blocklist_fd) {
     struct flow_key keys[BATCH_SIZE];
     struct ips_allowlist_data values[BATCH_SIZE];
@@ -492,6 +553,14 @@ static void allowlist_reconciliation(int allowlist_fd, int blocklist_fd, int sta
         if (err != 0) break;
         in_batch = &batch_token;
     }
+}
+
+// Boot-monotonic seconds, matching bpf_ktime_get_ns()/1e9 used for ips_allowlist_data.last_seen
+// in fast_path/ips.bpf.c -- NOT wall-clock time (see the comment on that struct).
+static uint64_t monotonic_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec;
 }
 
 static void age_allowlist_map(int allowlist_fd, const struct ips_config *config, uint64_t current_time) {
@@ -665,6 +734,9 @@ int main(int argc, char **argv) {
     int static_blocklist_fd = bpf_map__fd(skel->maps.static_blocklist); // threat-intel (LPM_TRIE)
     int allowlist_fd = bpf_map__fd(skel->maps.allowlist);
     int honeypot_fd = bpf_map__fd(skel->maps.honeypot_map);
+    int excluded_srcs_fd = bpf_map__fd(skel->maps.excluded_srcs);
+
+    load_excluded_srcs(excluded_srcs_fd, &current_config);
 
     if (mkdir(IPS_SAVE_DIR, 0755) == 0) {
         printf("[i] Created new storage directory at %s\n", IPS_SAVE_DIR);
@@ -723,6 +795,7 @@ int main(int argc, char **argv) {
         }
 
         uint64_t current_time = (uint64_t)time(NULL);
+        uint64_t current_boot_time = monotonic_seconds();
 
         // ====================================================================
         // ALLOWLIST/BLOCKLIST RECONCILIATION
@@ -736,7 +809,7 @@ int main(int argc, char **argv) {
 
         age_blocklist_map(blocklist_fd, &current_config, current_time); //aging logic for the blocklist map
 
-        age_allowlist_map(allowlist_fd, &current_config, current_time); //idle-flow eviction for the allowlist
+        age_allowlist_map(allowlist_fd, &current_config, current_boot_time); //idle-flow eviction for the allowlist
         
         // ====================================================================
         // STATIC THREAT INTEL: periodic re-injection + TTL sweep

@@ -24,10 +24,24 @@ struct ips_blocklist_data {
 };
 
 // Presence in the allowlist map means trusted; last_seen is refreshed on every packet
-// slow_path_sniffer() observes for an already-trusted flow, so age_allowlist_map() only
+// fast_path_parser() observes for an already-trusted flow, so age_allowlist_map() only
 // evicts flows that have genuinely gone idle, not ones still actively passing traffic.
+// last_seen is boot-monotonic seconds (bpf_ktime_get_ns()/1e9 in-kernel, CLOCK_MONOTONIC
+// in user-space) -- NOT wall-clock epoch time. XDP can't produce a wall-clock timestamp,
+// and since allowlist state is never reloaded across a restart (unlike blocklist.csv), the
+// only consumer of last_seen is age_allowlist_map()'s in-process TTL comparison, so the
+// clock domain just needs to be self-consistent, not tied to wall time.
 struct ips_allowlist_data {
     __u64 last_seen;
+};
+
+// Per-source-IP "5 clean observations -> trust" probation counter (the greylist). Presence
+// alone means "on probation"; authorized=1 is a permanent fast-track that survives even if
+// the flow's allowlist entry later ages out, so a proven-clean IP never has to re-earn trust
+// unless this LRU map itself evicts the entry under memory pressure.
+struct ips_greylist_data {
+    __u32 count;
+    __u8 authorized;
 };
 
 // ==============================================================================
@@ -39,7 +53,8 @@ struct ips_allowlist_data {
 // so new detectors (honeypot hits, port scans, manual bans, ...) can submit
 // events with their own reason without touching the consumer.
 enum ips_ban_reason {
-    IPS_BAN_REASON_RATE_LIMIT = 0, // Token bucket exhausted (packet flood)
+    IPS_BAN_REASON_RATE_LIMIT = 0,     // Token bucket exhausted (packet flood)
+    IPS_BAN_REASON_MALFORMED_FLAGS = 1, // syn+fin / null scan / fin+psh+urg
 };
 
 struct ips_ban_event {
@@ -61,6 +76,8 @@ struct lpm_ip_key {
     __u32 ip;        // The actual IP address (in network byte order)
 };
 
+#define MAX_EXCLUDED_SRCS 16 // cap on excluded_source_ips entries parsed from config.ini
+
 // ==============================================================================
 // #REQ-XXX: .ini config file
 // ==============================================================================
@@ -75,6 +92,10 @@ struct ips_config {
     unsigned int state_dump_interval_sec; // How often the tracker/allowlist/honeypot CSVs are rewritten for monitor.py
     char wan_interface[16]; // matches IFNAMSIZ; upstream-facing physical interface (e.g. eth0)
     char lan_interface[16]; // matches IFNAMSIZ; internal-facing physical interface (e.g. eth1)
+    // Source IPs/subnets exempt from the greylist bootstrap (e.g. the router's own bridged
+    // traffic reflecting back) -- pushed into the excluded_srcs BPF map once at startup.
+    struct lpm_ip_key excluded_srcs[MAX_EXCLUDED_SRCS];
+    unsigned int excluded_srcs_count;
 };
 
 struct flow_key {

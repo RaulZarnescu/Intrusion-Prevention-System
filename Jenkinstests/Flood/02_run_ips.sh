@@ -60,11 +60,18 @@ CONFIG_BACKUP="$REPO_ROOT/config/config.ini.bak"
 if [ ! -f "$CONFIG_BACKUP" ]; then
     cp "$CONFIG_INI" "$CONFIG_BACKUP"
 fi
-grep -v -E "^(wan_interface|lan_interface)[[:space:]]*=" "$CONFIG_BACKUP" > "$CONFIG_INI.tmp"
+#
+# Also appends 10.200.0.71/32 to excluded_source_ips - 03b_allowlist_test.py sends clean
+# traffic from that IP and expects it to NEVER get promoted to the allowlist, proving the
+# excluded_srcs BPF map (populated once at startup, same as here) actually gates STAGE 5.
+# This has to happen before ips_loader starts: config.ini is only read once at boot, there's
+# no reload mechanism, so patching it after 03b's traffic wouldn't take effect.
+grep -v -E "^(wan_interface|lan_interface|excluded_source_ips)[[:space:]]*=" "$CONFIG_BACKUP" > "$CONFIG_INI.tmp"
 {
     cat "$CONFIG_INI.tmp"
     echo "wan_interface = test-wan"
     echo "lan_interface = test-lan"
+    echo "excluded_source_ips = 192.168.56.103/32,10.0.2.15/32,127.0.0.0/8,10.200.0.71/32"
 } > "$CONFIG_INI"
 rm -f "$CONFIG_INI.tmp"
 

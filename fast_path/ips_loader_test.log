@@ -1,0 +1,33 @@
+Excluded source: 192.168.56.103/32
+Excluded source: 10.0.2.15/32
+Excluded source: 127.0.0.0/8
+Loading IPS with: 
+Ban Duration: 3600 seconds
+Bucket size: 50 tokens
+Token Refill Rate: 20 tokens/sec
+Max Tolerated Drops: 15 drops
+Threat Intel Refresh: 86400 seconds
+Allowlist TTL: 900 seconds
+State Dump Interval: 5 seconds
+WAN Interface: test-wan
+LAN Interface: test-lan
+Excluded source: 192.168.56.103/32
+Excluded source: 10.0.2.15/32
+Excluded source: 127.0.0.0/8
+Excluded source: 10.200.0.71/32
+[+] Configuration loaded successfully.
+[+] static_blocklist map pinned to /sys/fs/bpf/ips_static_blocklist.
+[i] Resolved interface test-wan (Index: 10)
+[i] Resolved interface test-lan (Index: 12)
+[+] XDP attached to test-wan (Index: 10)
+[+] XDP attached to test-lan (Index: 12)
+IPS Fast-Path successfully attached to test-wan and test-lan!
+XDP is active. Listening for traffic...
+[i] Loaded 0 bans from ../data/blocklist.csv
+[i] Parsing and injecting IPs from ../fast_path/threats.txt...
+[-] Warning: Skipping invalid IP format: not_an_ip_address
+--- System Status: Event-Driven Mode Active ---
+[Slow-Path] Packet sniffer thread started and listening on ifindex 12...
+[Slow-Path] Packet sniffer thread started and listening on ifindex 10...
+[!] BAN: 10.200.0.66 (rate limit exceeded) Drops: 16
+[i] Ban appended to disk.
