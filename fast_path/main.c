@@ -138,9 +138,6 @@ static void load_config(const char *filename, struct ips_config *config) {
     }
     fclose(file);
 
-    // A stale-but-unpurged allowlist entry can only outlive an unban if it survives at
-    // least as long as the ban itself -- keeping the TTL shorter guarantees a formerly-
-    // banned IP's old trust has already decayed by the time it would matter again.
     if (config->allowlist_ttl_sec >= config->ban_duration_sec) {
         fprintf(stderr, "[!] WARNING: allowlist_ttl_seconds (%u) >= ban_duration_seconds (%u) -- "
                          "a flow could regain trust before a ban on the same IP would even expire.\n",
@@ -162,15 +159,18 @@ static void load_blocklist_from_csv(int blocklist_fd) {
 
     // Read the CSV line by line (Format: IP,Prefixlen,Timestamp,IsStatic). blocklist.csv only
     // ever holds dynamic bans (see filter_dynamic_only at the write side), so prefixlen is
-    // always 32 here -- it's kept in the format for backward compatibility with old CSVs and
-    // with monitor.py, but the dynamic map itself is a plain HASH keyed on the bare IP.
+    // always 32 here
     while (fgets(line, sizeof(line), fp)) {
         char ip_str[32];
         uint64_t ts;
 
         if (sscanf(line, "%31[^,],%*u,%lu,%*d", ip_str, &ts) == 2) {
             struct in_addr addr;
-            inet_aton(ip_str, &addr); 
+            int ok = inet_aton(ip_str, &addr);
+            if (!ok) {
+                fprintf(stderr, "[w] Warning, couldn't convert ip to binary: %s\n", ip_str);
+                continue;
+            }
 
             struct ips_blocklist_data val = { .ban_timestamp = ts, .is_static = 0 };
 
@@ -183,18 +183,10 @@ static void load_blocklist_from_csv(int blocklist_fd) {
     printf("[i] Loaded %d bans from %s\n", count, CSV_FILE);
 }
 
-// ------------------------------------------------------------------------------------------------------------
-// Generic batched map -> CSV dump. Saves RAM to Disk whenever a change happens.
-// `fmt` renders one key/value pair; `key_size`/`value_size` are that map's key/value type
-// sizes, used to stride through the raw batch buffers since both can differ per map.
-// ------------------------------------------------------------------------------------------------------------
-
 typedef void (*csv_formatter_fn)(FILE *fp, const void *key, const void *value);
 // Returns non-zero to include the row, 0 to skip it. NULL means "include everything".
 typedef int (*csv_filter_fn)(const void *key, const void *value);
 
-// blocklist is now a plain HASH map (dynamic bans only), keyed on the bare IP -- prefixlen
-// is always 32 here but kept in the row format for compatibility with monitor.py.
 static void fmt_blocklist_row(FILE *fp, const void *key, const void *value) {
     const __u32 *k = key;
     const struct ips_blocklist_data *v = value;
@@ -223,11 +215,15 @@ static void save_batch_map_to_csv(int fd, const char *temp_file, const char *fin
                             size_t key_size, size_t value_size, csv_formatter_fn fmt,
                             csv_filter_fn filter) {
     FILE *fp = fopen(temp_file, "w");
-    if (!fp) return;
+    if (!fp) {
+        fprintf(stderr, "[!] Failed to open %s for writing: %s\n", temp_file, strerror(errno));
+        return;
+    }
 
     void *keys = malloc((size_t)BATCH_SIZE * key_size);
     void *values = malloc((size_t)BATCH_SIZE * value_size);
     if (!keys || !values) {
+        fprintf(stderr, "[i] Could not allocate memory to save batch to csv: %s\n", strerror(errno));
         free(keys);
         free(values);
         fclose(fp);
@@ -260,12 +256,14 @@ static void save_batch_map_to_csv(int fd, const char *temp_file, const char *fin
     free(keys);
     free(values);
     fclose(fp);
-    rename(temp_file, final_file); 
+    int rename_err = rename(temp_file, final_file);
+    if (rename_err != 0) {
+        fprintf(stderr, "[!] Failed to rename %s to %s: %s\n", temp_file, final_file, strerror(errno));
+    }
 }
 
 static void save_blocklist_to_csv(int blocklist_fd) {
-    // No filter needed: blocklist is now structurally dynamic-only (static entries
-    // live in the separate static_blocklist map), so nothing here needs excluding.
+
     save_batch_map_to_csv(blocklist_fd, CSV_TEMP, CSV_FILE,
                            sizeof(__u32), sizeof(struct ips_blocklist_data),
                            fmt_blocklist_row, NULL);
@@ -285,7 +283,10 @@ static void save_simple_map_to_csv(int fd, const char *temp_file, const char *fi
 // ------------------------------------------------------------------------------------------------------------
 static void save_allowlist_to_csv(int fd, const char *temp_file, const char *final_file) {
     FILE *fp = fopen(temp_file, "w");
-    if (!fp) return;
+    if (!fp) {
+        fprintf(stderr, "[!] Failed to open %s for writing: %s\n", temp_file, strerror(errno));
+        return;
+    }
 
     struct flow_key prev_key = {0};
     struct flow_key next_key;
@@ -308,14 +309,12 @@ static void save_allowlist_to_csv(int fd, const char *temp_file, const char *fin
     }
     
     fclose(fp);
-    rename(temp_file, final_file);
+    int rename_err = rename(temp_file, final_file);
+    if (rename_err != 0) {
+        fprintf(stderr, "[!] Failed to rename %s to %s: %s\n", temp_file, final_file, strerror(errno));
+    }
 }
 
-// A new ban only ever adds one entry, so persisting it doesn't need to read the whole
-// map back and rewrite the whole file (O(n) per ban -> O(n^2) for n bans in a burst).
-// Just append the one line. The eBPF map stays the source of truth; save_blocklist_to_csv()
-// (driven by aging, when a ban expires) still does the full rewrite, which reconciles/
-// compacts the file since removing a line from a flat file can't be done incrementally.
 static void append_blocklist_entry_to_csv(__u32 ip, const struct ips_blocklist_data *block_data) {
     FILE *fp = fopen(CSV_FILE, "a");
     if (!fp) {
@@ -352,7 +351,12 @@ static int handle_ban_event(void *ctx, void *data, size_t data_sz) {
     block_data.is_static = 0;
 
     // blocklist is a plain HASH map keyed on the bare IP
-    bpf_map_update_elem(blocklist_fd, &event->src_ip, &block_data, BPF_ANY);
+    int err = bpf_map_update_elem(blocklist_fd, &event->src_ip, &block_data, BPF_ANY);
+
+    if (err != 0) {
+        fprintf(stderr, " [!] Bpf map was not updated (err=%d): %s\n", err, strerror(errno));
+        return 1;
+    }
 
     // O(1) append instead of an O(n) full blocklist dump
     append_blocklist_entry_to_csv(event->src_ip, &block_data);
@@ -381,6 +385,7 @@ pthread_mutex_t greylist_lock = PTHREAD_MUTEX_INITIALIZER;
 static int track_and_check_greylist(__u32 src_ip, int mark_authorized) {
     uint32_t idx = src_ip % GREYLIST_MAX;
     int result = 0;
+    int slot_found = 0;
 
     pthread_mutex_lock(&greylist_lock);
 
@@ -388,6 +393,7 @@ static int track_and_check_greylist(__u32 src_ip, int mark_authorized) {
         uint32_t probe = (idx + i) % GREYLIST_MAX;
 
         if (greylist_tracker[probe].ip == src_ip) {
+            slot_found = 1;
             if (mark_authorized) {
                 greylist_tracker[probe].authorized = 1;
                 result = -1;
@@ -403,6 +409,7 @@ static int track_and_check_greylist(__u32 src_ip, int mark_authorized) {
         }
 
         if (greylist_tracker[probe].ip == 0) {
+            slot_found = 1;
             if (mark_authorized) {
                 result = -1;
                 break;
@@ -416,6 +423,14 @@ static int track_and_check_greylist(__u32 src_ip, int mark_authorized) {
     }
 
     pthread_mutex_unlock(&greylist_lock);
+
+    if (!slot_found) {
+        struct in_addr addr = { .s_addr = src_ip };
+        fprintf(stderr, "[!] Greylist probe chain exhausted for IP %s -- all 10 probed slots "
+                         "occupied by other IPs (table contention or GREYLIST_MAX too small).\n",
+                inet_ntoa(addr));
+    }
+
     return result;
 }
 
@@ -455,7 +470,11 @@ static void *slow_path_sniffer(void *arg) { // TODO: Streamline it
 
     while (1) {
         int data_size = recvfrom(raw_sock, buffer, sizeof(buffer), 0, NULL, NULL);
-        if (data_size < 0) continue;
+        if (data_size < 0) {
+            fprintf(stderr, "[!] recvfrom failed on slow-path sniffer (ifindex %d): %s\n",
+                    fds->ifindex, strerror(errno));
+            continue;
+        }
 
         struct ethhdr *eth = (struct ethhdr *)buffer;
         if (ntohs(eth->h_proto) != ETH_P_IP) continue;
@@ -846,11 +865,6 @@ static void state_dump(int tracker_fd, int allowlist_fd, int honeypot_fd, const 
 
 // TODO: Place these defines into a dedicated file for codes. Also set the codes as per a law (like HTTP errors with those 4xx, 3xx type of errors)
 
-// TODO:   Remaining gaps from the earlier list, in case you want to keep going: the silent fopen/malloc/rename failures in save_batch_map_to_csv/save_allowlist_to_csv,
-// inet_aton not checked in load_blocklist_from_csv, handle_ban_event not checking bpf_map_update_elem, recvfrom in slow_path_sniffer failing silently,
-// and track_and_check_greylist's exhausted-probe-chain case logging nothing.
-
-
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);   //disables buffering on stdout, writes straight in the file descriptor immediately, instead of accumulating in a buffer.
                             //stderr is already unbuffered from the lib
@@ -882,9 +896,6 @@ int main(int argc, char **argv) {
     if (mkdir(IPS_SAVE_DIR, 0755) == 0) {
         printf("[i] Created new storage directory at %s\n", IPS_SAVE_DIR);
     } else if (errno != EEXIST) {
-        // Every CSV write from here on targets a file inside IPS_SAVE_DIR, and fopen()
-        // failures on those are silent (see save_batch_map_to_csv/save_allowlist_to_csv) --
-        // catching it here, loudly, is the only place the real root cause would surface.
         fprintf(stderr, "[!] FATAL: Failed to create storage directory %s: %s\n", IPS_SAVE_DIR, strerror(errno));
         return EXIT_SAVE_DIR_FAILED;
     }
