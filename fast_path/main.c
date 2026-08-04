@@ -18,8 +18,17 @@
 #include "threat_intel.h"
 #include "main.h"
 #include "slow_path.h"
+#include <signal.h>
+
+volatile sig_atomic_t keep_running = 1;
+
+
 
 //------------------------------- Functions -----------------------------------------------------
+
+void handle_signal(int sig) {
+    keep_running = 0;
+}
 
 static bool parse_long(const char *str, long *out_val) {
     char *endptr;
@@ -140,6 +149,7 @@ static void load_config(const char *filename, struct ips_config *config) {
             else if (strcmp(key, "token_bucket_max") == 0) {
                 if (parsed_val == 0) {
                     fprintf(stderr, "[!] config.ini is not valid. Max bucket tokens can not be 0. (Minimum is 1)\n");
+                    fclose(file);
                     return;
                 }
                 config->token_bucket_max = (unsigned int)parsed_val;
@@ -251,8 +261,8 @@ static void save_batch_map_to_csv(int fd, const char *temp_file, const char *fin
         return;
     }
 
-    void *keys = malloc((size_t)BATCH_SIZE * key_size);
-    void *values = malloc((size_t)BATCH_SIZE * value_size);
+    void *keys = calloc(BATCH_SIZE, key_size);
+    void *values = calloc(BATCH_SIZE, value_size);
     if (!keys || !values) {
         fprintf(stderr, "[i] Could not allocate memory to save batch to csv: %s\n", strerror(errno));
         free(keys);
@@ -321,6 +331,7 @@ static void save_allowlist_to_csv(int fd, const char *temp_file, const char *fin
 
     struct flow_key prev_key = {0};
     struct flow_key next_key;
+    memset(&next_key, 0, sizeof(struct flow_key));
     struct ips_allowlist_data value;
 
     while (bpf_map_get_next_key(fd, &prev_key, &next_key) == 0) {
@@ -518,9 +529,9 @@ static void load_excluded_srcs(int excluded_srcs_fd, const struct ips_config *co
 }
 
 static void allowlist_reconciliation(int allowlist_fd, int blocklist_fd, int static_blocklist_fd) {
-    struct flow_key keys[BATCH_SIZE];
-    struct ips_allowlist_data values[BATCH_SIZE];
-    struct flow_key expired[BATCH_SIZE];
+    struct flow_key keys[BATCH_SIZE] = {0};
+    struct ips_allowlist_data values[BATCH_SIZE] = {0};
+    struct flow_key expired[BATCH_SIZE] = {0};
 
     __u32 batch_token;
     void *in_batch = NULL;
@@ -534,7 +545,7 @@ static void allowlist_reconciliation(int allowlist_fd, int blocklist_fd, int sta
 
         __u32 expired_count = 0;
         for (__u32 i = 0; i < count; i++) {
-            struct ips_blocklist_data dummy_val;
+            struct ips_blocklist_data dummy_val = {0};
             struct lpm_ip_key static_lookup_key = { .prefixlen = 32, .ip = keys[i].source_ip };
 
             bool is_blocked =
@@ -781,14 +792,19 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[!] Failed to create ring buffer\n");
         return EXIT_RINGBUF_FAILED;
     }
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
 
     printf("--- System Status: Event-Driven Mode Active ---\n");
 
     int exit_code = 0;
 
-    while (1) {
+    while (keep_running) {
         int err = ring_buffer__poll(rb, 1000);
         if (err < 0) {
+            if (err == -EINTR) {
+                break; // A signal interrupted the poll, exit gracefully
+            }
             fprintf(stderr, "[!] Error polling ring buffer: %d\n", err);
             exit_code = EXIT_RINGBUF_POLL_FAILED;
             break;
@@ -823,6 +839,8 @@ int main(int argc, char **argv) {
 
         state_dump(tracker_fd, allowlist_fd, honeypot_fd, &current_config, current_time, &last_state_dump); // run per interval given by config file
     }
+
+    printf("\n[i] Shutting down gracefully. Freeing resources...\n");
 
     ring_buffer__free(rb);
     bpf_link__destroy(ifaces.wan_link);
