@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <errno.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <net/if.h>
+#include <linux/if_link.h>
 #include <bpf/libbpf.h>
 #include "ips.skel.h"
 #include <arpa/inet.h>
@@ -9,7 +11,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <string.h>
-#include <stdlib.h> 
+#include <stdlib.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -468,21 +470,57 @@ static int start_sniffer_thread(pthread_t *thread, struct sniffer_args *args) {
     return 0;
 }
 
-struct bpf_link *attach_xdp(struct bpf_program *prog, unsigned int ifindex, const char *iface_name) {
-    struct bpf_link *link = bpf_program__attach_xdp(prog, ifindex);
-    if (!link) {
-        fprintf(stderr, "[!] Failed to attach XDP program to %s\n", iface_name);
-        return NULL;
+struct xdp_attach_result {
+    struct bpf_link *link; // non-NULL only when native mode succeeded
+    bool skb_mode;         // true => attached via the generic/SKB-mode fallback below (link is NULL)
+    bool ok;                // true if either mode succeeded
+};
+
+// Tries native XDP first (fastest, and gives us bpf_link's auto-detach-on-crash for free).
+// A lot of NIC drivers don't implement native XDP at all -- USB Ethernet adapters especially
+// (relevant on a Pi, where the second interface is very likely a USB adapter), but also
+// several onboard ARM/embedded drivers -- so on failure this retries in generic/SKB mode,
+// which every driver supports since it runs later in the stack, after skb allocation
+// (slower, but functionally equivalent for our purposes).
+// bpf_xdp_attach() (unlike bpf_program__attach_xdp()) isn't tied to a bpf_link, so a
+// SKB-mode attach has to be torn down explicitly with bpf_xdp_detach() using the same
+// flags -- see the wan_skb_mode/lan_skb_mode cleanup in main().
+static struct xdp_attach_result attach_xdp(struct bpf_program *prog, unsigned int ifindex, const char *iface_name) {
+    struct xdp_attach_result result = {0};
+
+    result.link = bpf_program__attach_xdp(prog, ifindex);
+    if (result.link) {
+        printf("[+] XDP attached to %s (Index: %u, native mode)\n", iface_name, ifindex);
+        result.ok = true;
+        return result;
     }
-    printf("[+] XDP attached to %s (Index: %u)\n", iface_name, ifindex);
-    return link;
+
+    fprintf(stderr, "[!] Native XDP attach failed on %s (%s) -- retrying in generic/SKB mode "
+                     "(expected on some USB/embedded NIC drivers without native XDP support)\n",
+            iface_name, strerror(errno));
+
+    int prog_fd = bpf_program__fd(prog);
+    int err = bpf_xdp_attach((int)ifindex, prog_fd, XDP_FLAGS_SKB_MODE, NULL);
+    if (err != 0) {
+        fprintf(stderr, "[!] Failed to attach XDP program to %s in either mode (err=%d): %s\n",
+                iface_name, err, strerror(-err));
+        return result; // ok stays false
+    }
+
+    printf("[+] XDP attached to %s (Index: %u, generic/SKB mode)\n", iface_name, ifindex);
+    result.skb_mode = true;
+    result.ok = true;
+    return result;
 }
 
 struct network_interfaces {
     unsigned int wan_ifindex;
     unsigned int lan_ifindex;
-    struct bpf_link *wan_link;
-    struct bpf_link *lan_link;
+    struct bpf_link *wan_link; // NULL if attached via SKB mode instead -- see wan_skb_mode
+    struct bpf_link *lan_link; // NULL if attached via SKB mode instead -- see lan_skb_mode
+    bool wan_skb_mode;
+    bool lan_skb_mode;
+    bool ok; // true only if both interfaces attached successfully, in either mode
 };
 
 // Resolves wan_interface/lan_interface from config and attaches fast_path_parser to both.
@@ -490,7 +528,7 @@ struct network_interfaces {
 // -- this only attaches the XDP filter to each physical member, it doesn't create the
 // bridge itself. Without that bridge existing, XDP_PASS on one NIC has nowhere to go and
 // no traffic actually crosses the Pi.
-// On any failure the relevant ifindex is 0 and/or the relevant link is NULL;
+// On any failure the relevant ifindex is 0 and/or ok is false;
 // resolve_interface()/attach_xdp() already printed the specific error.
 
 struct network_interfaces setup_network_interfaces(struct ips_bpf *skel, const struct ips_config *config) {
@@ -502,8 +540,14 @@ struct network_interfaces setup_network_interfaces(struct ips_bpf *skel, const s
         return ifaces;
     }
 
-    ifaces.wan_link = attach_xdp(skel->progs.fast_path_parser, ifaces.wan_ifindex, config->wan_interface);
-    ifaces.lan_link = attach_xdp(skel->progs.fast_path_parser, ifaces.lan_ifindex, config->lan_interface);
+    struct xdp_attach_result wan_result = attach_xdp(skel->progs.fast_path_parser, ifaces.wan_ifindex, config->wan_interface);
+    struct xdp_attach_result lan_result = attach_xdp(skel->progs.fast_path_parser, ifaces.lan_ifindex, config->lan_interface);
+
+    ifaces.wan_link = wan_result.link;
+    ifaces.lan_link = lan_result.link;
+    ifaces.wan_skb_mode = wan_result.skb_mode;
+    ifaces.lan_skb_mode = lan_result.skb_mode;
+    ifaces.ok = wan_result.ok && lan_result.ok;
 
     return ifaces;
 }
@@ -742,7 +786,7 @@ int main(int argc, char **argv) {
     }
 
     struct network_interfaces ifaces = setup_network_interfaces(skel, &current_config);
-    if (!ifaces.wan_link || !ifaces.lan_link) {
+    if (!ifaces.ok) {
         return EXIT_IFACE_SETUP_FAILED;
     }
 
@@ -861,8 +905,19 @@ int main(int argc, char **argv) {
     printf("\n[i] Shutting down gracefully. Freeing resources...\n");
 
     ring_buffer__free(rb);
-    bpf_link__destroy(ifaces.wan_link);
-    bpf_link__destroy(ifaces.lan_link);
+    // SKB-mode attaches aren't bpf_link-backed (see attach_xdp()), so they need the
+    // matching bpf_xdp_detach() instead of bpf_link__destroy() -- calling bpf_link__destroy()
+    // on a NULL link (the SKB-mode case) is a documented no-op, so no need to branch on that.
+    if (ifaces.wan_skb_mode) {
+        bpf_xdp_detach((int)ifaces.wan_ifindex, XDP_FLAGS_SKB_MODE, NULL);
+    } else {
+        bpf_link__destroy(ifaces.wan_link);
+    }
+    if (ifaces.lan_skb_mode) {
+        bpf_xdp_detach((int)ifaces.lan_ifindex, XDP_FLAGS_SKB_MODE, NULL);
+    } else {
+        bpf_link__destroy(ifaces.lan_link);
+    }
     ips_bpf__destroy(skel);
     return exit_code;
 }
