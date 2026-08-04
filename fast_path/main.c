@@ -241,7 +241,7 @@ static void fmt_blocklist_row(FILE *fp, const void *key, const void *value) {
     const __u32 *k = key;
     const struct ips_blocklist_data *v = value;
     struct in_addr addr = { .s_addr = *k };
-    fprintf(fp, "%s,%u,%llu,%llu\n", inet_ntoa(addr), 32,
+    fprintf(fp, "%s,%u,%llu,%llu\n", inet_ntoa(addr), 32U,
             (unsigned long long)v->ban_timestamp,
             (unsigned long long)v->is_static);
 }
@@ -284,9 +284,9 @@ static void save_batch_map_to_csv(int fd, const char *temp_file, const char *fin
     void *in_batch = NULL;          
     void *out_batch = &batch_token; 
     __u32 count;
-    int err = 0;
-
+    
     while (1) {
+        int err;
         count = BATCH_SIZE; 
         err = bpf_map_lookup_batch(fd, in_batch, out_batch, keys, values, &count, NULL);
 
@@ -546,9 +546,9 @@ static void allowlist_reconciliation(int allowlist_fd, int blocklist_fd, int sta
     void *in_batch = NULL;
     void *out_batch = &batch_token;
     __u32 count;
-    int err = 0;
-
+    
     while (1) {
+        int err;
         count = BATCH_SIZE;
         err = bpf_map_lookup_batch(allowlist_fd, in_batch, out_batch, keys, values, &count, NULL);
 
@@ -592,9 +592,9 @@ static void age_allowlist_map(int allowlist_fd, const struct ips_config *config,
     void *in_batch = NULL;
     void *out_batch = &batch_token;
     __u32 count;
-    int err = 0;
 
     while (1) {
+        int err;
         count = BATCH_SIZE;
         err = bpf_map_lookup_batch(allowlist_fd, in_batch, out_batch, keys, values, &count, NULL);
 
@@ -625,9 +625,9 @@ static void age_blocklist_map(int blocklist_fd, const struct ips_config *config,
     void *in_batch = NULL;
     void *out_batch = &batch_token;
     __u32 count;
-    int err = 0;
-
+    
     while (1) {
+        int err;
         count = BATCH_SIZE;
         err = bpf_map_lookup_batch(blocklist_fd, in_batch, out_batch, keys, values, &count, NULL);
 

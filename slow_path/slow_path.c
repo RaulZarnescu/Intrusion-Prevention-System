@@ -101,7 +101,7 @@ static int extract_sni(const unsigned char *payload, int len, char *sni, size_t 
 // needs handling too (deferred until after the IPv4 MVP is done).
 // ------------------------------------------------------------------------------------------------------------
 void *slow_path_sniffer(void *arg) { // TODO: Streamline it
-    struct sniffer_args *fds = (struct sniffer_args *)arg;
+    const struct sniffer_args *fds = (const struct sniffer_args *)arg;
 
     int raw_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (raw_sock < 0) {
