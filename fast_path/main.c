@@ -19,6 +19,7 @@
 #include "main.h"
 #include "slow_path.h"
 #include "sni_blocklist.h"
+#include "doh_resolver_blocklist.h"
 #include <signal.h>
 
 volatile sig_atomic_t keep_running = 1;
@@ -789,6 +790,7 @@ int main(int argc, char **argv) {
 
     refresh_threat_intel(static_blocklist_fd, &current_config, (uint64_t)time(NULL));
     load_sni_blocklist(SNI_BLOCKLIST_FILE);
+    load_doh_resolver_blocklist(DOH_RESOLVER_BLOCKLIST_FILE);
 
     // Anchors the periodic re-check below so it doesn't immediately re-run at t=0.
     uint64_t last_state_dump = (uint64_t)time(NULL);
@@ -832,6 +834,7 @@ int main(int argc, char **argv) {
             printf("[i] SIGHUP received -- forcing threat-intel and SNI blocklist reload.\n");
             refresh_threat_intel(static_blocklist_fd, &current_config, current_time);
             load_sni_blocklist(SNI_BLOCKLIST_FILE);
+            load_doh_resolver_blocklist(DOH_RESOLVER_BLOCKLIST_FILE);
         }
 
         // ====================================================================

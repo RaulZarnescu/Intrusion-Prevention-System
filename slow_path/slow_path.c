@@ -17,6 +17,7 @@
 
 #include "slow_path.h"
 #include "sni_blocklist.h"
+#include "doh_resolver_blocklist.h"
 #include "../fast_path/ips_fast_common.h"
 #include "../fast_path/main.h"
 
@@ -95,10 +96,12 @@ static int extract_sni(const unsigned char *payload, int len, char *sni, size_t 
 // SLOW-PATH: Deep Packet Inspection Thread
 // TODO: the malformed-TCP-flags check and the "5 clean observations -> trust" greylist
 // bootstrap that used to live here both now run at line rate in fast_path/ips.bpf.c instead.
-// Still missing per the spec: JA3/JA4 fingerprinting alongside SNI, ECH/DoH canary-domain
-// handling, and the actual decision to mirror uncertain traffic out to OoB for deep (non-inline)
-// analysis -- extract_sni() above only observes and logs for now, nothing consumes it yet. IPv6
-// needs handling too (deferred until after the IPv4 MVP is done).
+// Still missing per the spec: JA3/JA4 fingerprinting alongside SNI, and the actual decision
+// to mirror uncertain (no blocklist match) traffic out to OoB for deep (non-inline) analysis.
+// ECH-protected ClientHellos and QUIC/HTTP-3 (UDP/443) are both still invisible to this --
+// ECH encrypts the SNI field itself (no fix short of enterprise TLS interception), and QUIC
+// needs an entirely separate Initial-packet parser, out of scope for this pass. IPv6 also
+// still needs handling (deferred until after the IPv4 MVP is done).
 // ------------------------------------------------------------------------------------------------------------
 void *slow_path_sniffer(void *arg) { // TODO: Streamline it
     const struct sniffer_args *fds = (const struct sniffer_args *)arg;
@@ -142,8 +145,10 @@ void *slow_path_sniffer(void *arg) { // TODO: Streamline it
         struct tcphdr *tcp = (struct tcphdr *)(buffer + sizeof(struct ethhdr) + ip_hdr_len);
         if ((unsigned char *)(tcp + 1) > buffer + data_size) continue;
 
-        // Only the client -> server direction carries a ClientHello.
-        if (ntohs(tcp->dest) != 443) continue;
+        // Only the client -> server direction carries a ClientHello. 443 is plain HTTPS/DoH,
+        // 853 is DoT -- same TLS ClientHello framing either way, extract_sni() doesn't care
+        // which port it came from.
+        if (ntohs(tcp->dest) != 443 && ntohs(tcp->dest) != 853) continue;
 
         int payload_offset = sizeof(struct ethhdr) + ip_hdr_len + tcp->doff * 4;
         if (payload_offset >= data_size) continue;
@@ -153,7 +158,20 @@ void *slow_path_sniffer(void *arg) { // TODO: Streamline it
             struct in_addr src_addr = { .s_addr = ip->saddr };
             printf("[Slow-Path] [i] TLS ClientHello SNI from %s: %s\n", inet_ntoa(src_addr), sni);
 
+            const char *ban_reason = NULL;
             if (sni_blocklist_contains(sni)) {
+                ban_reason = "blocklisted SNI";
+            } else if (doh_resolver_blocklist_contains(sni)) {
+                // Caught trying to bypass local DNS enforcement via a known DoH/DoT resolver
+                // instead of the DHCP-assigned one. Reuses the same full-IP ban as malware
+                // SNI on purpose -- we can't selectively drop just this DNS query (XDP already
+                // passed it before this raw-socket copy is even seen), only ban the source
+                // going forward, and refusing network access is what actually enforces a
+                // "no bypassing local DNS" policy against a device that keeps retrying.
+                ban_reason = "known DoH/DoT resolver";
+            }
+
+            if (ban_reason) {
                 struct ips_blocklist_data block_data = {
                     .ban_timestamp = (uint64_t)time(NULL),
                     .is_static = 0,
@@ -163,7 +181,7 @@ void *slow_path_sniffer(void *arg) { // TODO: Streamline it
                     fprintf(stderr, "[!] Slow-Path: failed to ban %s for SNI %s (err=%d): %s\n",
                             inet_ntoa(src_addr), sni, err, strerror(errno));
                 } else {
-                    printf("[!] Slow-Path BAN: %s matched blocklisted SNI %s\n", inet_ntoa(src_addr), sni);
+                    printf("[!] Slow-Path BAN: %s matched %s (%s)\n", inet_ntoa(src_addr), ban_reason, sni);
                     append_blocklist_entry_to_csv(ip->saddr, &block_data);
                 }
             }

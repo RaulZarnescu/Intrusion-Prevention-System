@@ -1,0 +1,27 @@
+# Known public DNS-over-HTTPS / DNS-over-TLS resolver hostnames -- hand-curated, not fed by
+# an automated feed (see sni_blocklist.txt for the URLhaus-managed malware list). A match
+# here means a device on the LAN is trying to bypass local DNS enforcement by querying one
+# of these directly (port 443 or 853) instead of the DHCP-assigned resolver. Not exhaustive --
+# add resolvers as you see them show up in slow-path logs.
+
+cloudflare-dns.com
+mozilla.cloudflare-dns.com
+one.one.one.one
+dns.google
+dns.google.com
+doh.opendns.com
+doh.familyshield.opendns.com
+dns.quad9.net
+dns10.quad9.net
+dns11.quad9.net
+doh.cleanbrowsing.org
+family-filter-dns.cleanbrowsing.org
+security-filter-dns.cleanbrowsing.org
+doh.dns.sb
+dns.nextdns.io
+doh.libredns.gr
+dns.adguard.com
+dns-family.adguard.com
+unfiltered.adguard-dns.com
+doh.mullvad.net
+adblock.doh.mullvad.net
