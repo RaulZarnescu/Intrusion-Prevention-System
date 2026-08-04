@@ -16,7 +16,9 @@
 #include <bpf/bpf.h>
 
 #include "slow_path.h"
+#include "sni_blocklist.h"
 #include "../fast_path/ips_fast_common.h"
+#include "../fast_path/main.h"
 
 // ------------------------------------------------------------------------------------------------------------
 // TLS CLIENTHELLO / SNI EXTRACTION
@@ -150,8 +152,23 @@ void *slow_path_sniffer(void *arg) { // TODO: Streamline it
         if (extract_sni(buffer + payload_offset, data_size - payload_offset, sni, sizeof(sni))) {
             struct in_addr src_addr = { .s_addr = ip->saddr };
             printf("[Slow-Path] [i] TLS ClientHello SNI from %s: %s\n", inet_ntoa(src_addr), sni);
-            // TODO: decide "uncertain" and mirror to OoB here -- that pipeline doesn't exist
-            // yet (see the file-level TODO above), so this only observes and logs for now.
+
+            if (sni_blocklist_contains(sni)) {
+                struct ips_blocklist_data block_data = {
+                    .ban_timestamp = (uint64_t)time(NULL),
+                    .is_static = 0,
+                };
+                int err = bpf_map_update_elem(fds->blocklist_fd, &ip->saddr, &block_data, BPF_ANY);
+                if (err != 0) {
+                    fprintf(stderr, "[!] Slow-Path: failed to ban %s for SNI %s (err=%d): %s\n",
+                            inet_ntoa(src_addr), sni, err, strerror(errno));
+                } else {
+                    printf("[!] Slow-Path BAN: %s matched blocklisted SNI %s\n", inet_ntoa(src_addr), sni);
+                    append_blocklist_entry_to_csv(ip->saddr, &block_data);
+                }
+            }
+            // TODO: decide "uncertain" (no match either way) and mirror to OoB here -- that
+            // pipeline doesn't exist yet (see the file-level TODO above).
         }
     }
     close(raw_sock);

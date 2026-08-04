@@ -2,7 +2,10 @@
 Description=Periodically refresh IPS threat-intel blocklist (threats.txt)
 
 [Timer]
-# Runs once a 12h so it is updated when the fetch (24h) happens
+# The service this fires (ips-threat-intel-update.service) SIGHUPs ips_loader right after
+# a successful download, so the daemon picks up changes within seconds of this timer
+# firing -- 12h just controls how often we bother re-checking Spamhaus DROP, no longer
+# how stale the daemon's own view can get.
 OnBootSec=5min
 OnUnitActiveSec=12h
 Persistent=true

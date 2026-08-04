@@ -18,9 +18,14 @@
 #include "threat_intel.h"
 #include "main.h"
 #include "slow_path.h"
+#include "sni_blocklist.h"
 #include <signal.h>
 
 volatile sig_atomic_t keep_running = 1;
+// Set by handle_sighup(), consumed once per loop iteration in main() -- forces an
+// immediate threat-intel/SNI-blocklist reload without waiting out either timer, e.g.
+// `kill -HUP <pid>` right after scripts/update_threat_intel.sh or update_sni_blocklist.sh.
+volatile sig_atomic_t reload_requested = 0;
 
 
 
@@ -28,6 +33,10 @@ volatile sig_atomic_t keep_running = 1;
 
 void handle_signal(int sig) {
     keep_running = 0;
+}
+
+void handle_sighup(int sig) {
+    reload_requested = 1;
 }
 
 static bool parse_long(const char *str, long *out_val) {
@@ -165,7 +174,7 @@ static void load_config(const char *filename, struct ips_config *config) {
             }
             else if (strcmp(key, "threat_intel_refresh_seconds") == 0) {
                 config->threat_intel_refresh_sec = (unsigned int)parsed_val;
-                fprintf(stdout, "Threat Intel Refresh: %u seconds\n", config->threat_intel_refresh_sec);
+                fprintf(stdout, "Threat Intel Staleness Window: %u seconds (TTL basis only -- refresh is SIGHUP-driven)\n", config->threat_intel_refresh_sec);
             }
             else if (strcmp(key, "allowlist_ttl_seconds") == 0) {
                 config->allowlist_ttl_sec = (unsigned int)parsed_val;
@@ -657,43 +666,42 @@ static void age_blocklist_map(int blocklist_fd, const struct ips_config *config,
 }
 
 
-static void inject_threat_info_periodically( int static_blocklist_fd, const struct ips_config *config, uint64_t current_time, uint64_t *last_static_refresh) {
+// Re-injects threats.txt (a pure upsert -- entries still present just get their
+// ban_timestamp bumped to "now") and sweeps out static entries that have gone stale.
+// No internal timer: this runs once at boot and otherwise only on SIGHUP (see main()'s
+// loop) -- scripts/update_threat_intel.sh refreshing the file on disk and then signaling
+// the daemon is what drives this now, not a polling interval.
+static void refresh_threat_intel(int static_blocklist_fd, const struct ips_config *config, uint64_t current_time) {
+    inject_threat_intel(THREATS_INTEL_FILE, static_blocklist_fd);
 
-        if ((current_time - *last_static_refresh) >= config->threat_intel_refresh_sec) {
-            // Re-run threats.txt: a pure upsert, so entries still present just get their
-            // ban_timestamp refreshed to "now". Entries no longer in the file simply stop
-            // being refreshed and fall behind, which is what the sweep below acts on.
-            inject_threat_intel(THREATS_INTEL_FILE, static_blocklist_fd);
+    // An entry is stale once it's gone two refreshes' worth of time without being
+    // re-injected -- threat_intel_refresh_sec is just the nominal cadence used for this
+    // math now, not a literal polling interval.
+    uint64_t static_ttl = 2ULL * config->threat_intel_refresh_sec;
 
-            // Entries that missed two refreshes, are aged
-            uint64_t static_ttl = 2ULL * config->threat_intel_refresh_sec;
+    struct lpm_ip_key st_key = { .prefixlen = 32, .ip = 0 }, st_next_key;
+    struct ips_blocklist_data st_value;
+    struct lpm_ip_key expired_static_keys[BATCH_SIZE];
+    int expired_static_count = 0;
 
-            struct lpm_ip_key st_key = { .prefixlen = 32, .ip = 0 }, st_next_key;
-            struct ips_blocklist_data st_value;
-            struct lpm_ip_key expired_static_keys[BATCH_SIZE];
-            int expired_static_count = 0;
+    while (bpf_map_get_next_key(static_blocklist_fd, &st_key, &st_next_key) == 0) {
+        bpf_map_lookup_elem(static_blocklist_fd, &st_next_key, &st_value);
 
-            while (bpf_map_get_next_key(static_blocklist_fd, &st_key, &st_next_key) == 0) {
-                bpf_map_lookup_elem(static_blocklist_fd, &st_next_key, &st_value);
-
-                if (st_value.ban_timestamp != 0 &&
-                    (current_time - st_value.ban_timestamp) > static_ttl &&
-                    expired_static_count < BATCH_SIZE) {
-                    expired_static_keys[expired_static_count++] = st_next_key;
-                }
-                st_key = st_next_key;
-            }
-
-            for (int i = 0; i < expired_static_count; i++) {
-                struct in_addr unban_ip;
-                unban_ip.s_addr = expired_static_keys[i].ip;
-                bpf_map_delete_elem(static_blocklist_fd, &expired_static_keys[i]);
-                printf("[i] STATIC AGING: %s/%u missing from threats.txt for too long. Unbanned.\n",
-                       inet_ntoa(unban_ip), expired_static_keys[i].prefixlen);
-            }
-
-            *last_static_refresh = current_time;
+        if (st_value.ban_timestamp != 0 &&
+            (current_time - st_value.ban_timestamp) > static_ttl &&
+            expired_static_count < BATCH_SIZE) {
+            expired_static_keys[expired_static_count++] = st_next_key;
         }
+        st_key = st_next_key;
+    }
+
+    for (int i = 0; i < expired_static_count; i++) {
+        struct in_addr unban_ip;
+        unban_ip.s_addr = expired_static_keys[i].ip;
+        bpf_map_delete_elem(static_blocklist_fd, &expired_static_keys[i]);
+        printf("[i] STATIC AGING: %s/%u missing from threats.txt for too long. Unbanned.\n",
+               inet_ntoa(unban_ip), expired_static_keys[i].prefixlen);
+    }
 }
 
 static void state_dump(int tracker_fd, int allowlist_fd, int honeypot_fd, const struct ips_config *config, uint64_t current_time, uint64_t *last_state_dump) {
@@ -779,10 +787,10 @@ int main(int argc, char **argv) {
 
     // --- REBUILD STATIC THREAT INTEL ---
 
-    inject_threat_intel(THREATS_INTEL_FILE, static_blocklist_fd);
+    refresh_threat_intel(static_blocklist_fd, &current_config, (uint64_t)time(NULL));
+    load_sni_blocklist(SNI_BLOCKLIST_FILE);
 
     // Anchors the periodic re-check below so it doesn't immediately re-run at t=0.
-    uint64_t last_static_refresh = (uint64_t)time(NULL);
     uint64_t last_state_dump = (uint64_t)time(NULL);
 
     // --- SETUP RING BUFFER ---
@@ -794,6 +802,7 @@ int main(int argc, char **argv) {
     }
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
+    signal(SIGHUP, handle_sighup);
 
     printf("--- System Status: Event-Driven Mode Active ---\n");
 
@@ -801,17 +810,29 @@ int main(int argc, char **argv) {
 
     while (keep_running) {
         int err = ring_buffer__poll(rb, 1000);
-        if (err < 0) {
-            if (err == -EINTR) {
-                break; // A signal interrupted the poll, exit gracefully
-            }
+        if (err < 0 && err != -EINTR) {
             fprintf(stderr, "[!] Error polling ring buffer: %d\n", err);
             exit_code = EXIT_RINGBUF_POLL_FAILED;
             break;
         }
+        if (err == -EINTR && !keep_running) {
+            break; // SIGINT/SIGTERM interrupted the poll, exit gracefully
+        }
+        // Any other -EINTR (e.g. SIGHUP) falls through -- keep_running is still set, so the
+        // loop just carries on into the periodic checks below instead of shutting down.
 
         uint64_t current_time = (uint64_t)time(NULL);
         uint64_t current_boot_time = monotonic_seconds();
+
+        // ====================================================================
+        // SIGHUP: force an immediate threat-intel + SNI blocklist reload
+        // ====================================================================
+        if (reload_requested) {
+            reload_requested = 0;
+            printf("[i] SIGHUP received -- forcing threat-intel and SNI blocklist reload.\n");
+            refresh_threat_intel(static_blocklist_fd, &current_config, current_time);
+            load_sni_blocklist(SNI_BLOCKLIST_FILE);
+        }
 
         // ====================================================================
         // ALLOWLIST/BLOCKLIST RECONCILIATION
@@ -827,12 +848,6 @@ int main(int argc, char **argv) {
 
         age_allowlist_map(allowlist_fd, &current_config, current_boot_time); //idle-flow eviction for the allowlist
         
-        // ====================================================================
-        // STATIC THREAT INTEL: periodic re-injection + TTL sweep
-        // ====================================================================
-
-        inject_threat_info_periodically(static_blocklist_fd, &current_config, current_time, &last_static_refresh);
-
         // ====================================================================
         // STATE DUMP: tracker/allowlist/honeypot CSVs
         // ====================================================================

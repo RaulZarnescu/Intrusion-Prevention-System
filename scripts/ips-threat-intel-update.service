@@ -8,4 +8,12 @@ Type=oneshot
 # EDIT: path to the repo on this host (e.g. /home/pi/Intrusion-Prevention-System)
 ExecStart=/home/raul/CLionProjects/Intrusion-Prevention-System/scripts/update_threat_intel.sh
 
+# ips_loader no longer polls threats.txt on a timer -- it only re-reads it on SIGHUP, so
+# a refresh that doesn't also signal the daemon would just sit on disk unused. The '+'
+# runs this one command as root regardless of the User= below (systemd feature), which is
+# required here since ips-loader.service itself runs as root and only root can signal it.
+# `|| true` keeps a stopped/not-yet-started daemon from turning a successful file refresh
+# into a reported service failure.
+ExecStartPost=+/bin/sh -c '/usr/bin/systemctl kill -s HUP ips-loader.service || true'
+
 User=raul

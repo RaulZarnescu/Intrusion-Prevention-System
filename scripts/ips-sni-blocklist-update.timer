@@ -1,0 +1,15 @@
+[Unit]
+Description=Periodically refresh IPS SNI blocklist (sni_blocklist.txt)
+
+[Timer]
+# ips-sni-blocklist-update.service SIGHUPs ips_loader right after a successful download,
+# so the daemon picks up changes within seconds of this timer firing -- this interval just
+# controls how often we bother re-checking URLhaus, not how stale the daemon's own view
+# can get. Domain-based feeds churn faster than IP netblocks, so this runs more often than
+# the 12h threat-intel timer.
+OnBootSec=5min
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

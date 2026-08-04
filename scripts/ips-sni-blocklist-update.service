@@ -1,0 +1,18 @@
+[Unit]
+Description=Refresh IPS SNI blocklist (sni_blocklist.txt) from URLhaus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# EDIT: path to the repo on this host (e.g. /home/pi/Intrusion-Prevention-System)
+ExecStart=/home/raul/CLionProjects/Intrusion-Prevention-System/scripts/update_sni_blocklist.sh
+
+# Same reasoning as ips-threat-intel-update.service: ips_loader only re-reads
+# sni_blocklist.txt on SIGHUP now, not on a timer, so a refresh has to signal it to take
+# effect. '+' runs this one command as root regardless of User= below (ips-loader.service
+# runs as root); `|| true` keeps a stopped/not-yet-started daemon from turning a
+# successful file refresh into a reported service failure.
+ExecStartPost=+/bin/sh -c '/usr/bin/systemctl kill -s HUP ips-loader.service || true'
+
+User=raul

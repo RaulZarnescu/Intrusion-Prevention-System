@@ -1,0 +1,5 @@
+# Dummy SNI blocklist
+# Designed to test the C parser -- replaced by scripts/update_sni_blocklist.sh (URLhaus feed)
+
+malicious-test-domain.example
+another-bad-domain.example
