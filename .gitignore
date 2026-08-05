@@ -16,3 +16,16 @@ cmake-build-debug/
 *.out
 fast_path/ips_loader
 fast_path/ips_injector
+
+# Machine-specific runtime config -- copy from the matching .example file and
+# edit for this host (interface names, absolute paths)
+config/config.ini
+scripts/ips-loader.service
+
+# Runtime-generated state (bans, tracked IPs, allowlist, honeypot hits) --
+# regenerated per-deployment, not shared across machines
+data/*.csv
+
+# BPF CO-RE relocation header, regenerated per target kernel via:
+#   bpftool btf dump file /sys/kernel/btf/vmlinux format c > fast_path/vmlinux.h
+fast_path/vmlinux.h

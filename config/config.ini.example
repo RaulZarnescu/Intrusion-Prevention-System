@@ -1,0 +1,20 @@
+# /config/config.ini.example
+# Copy this file to config/config.ini and edit the values below for this host.
+# config/config.ini itself is gitignored -- every deployment (dev machine, each
+# physical box) keeps its own local copy, since wan_interface/lan_interface and
+# excluded_source_ips are specific to that machine's NICs and network.
+
+ban_duration_seconds = 3600
+token_bucket_max = 50
+token_refill_rate = 20
+max_tolerated_drops = 15
+threat_intel_refresh_seconds = 86400
+allowlist_ttl_seconds = 900
+state_dump_interval_seconds = 5
+# Fill in with this host's real interface names, e.g. from `ip -brief link show`.
+wan_interface = eth0
+lan_interface = eth1
+# Comma-separated CIDR list, exempt from the greylist bootstrap (e.g. this host's own
+# bridged traffic reflecting back, plus loopback). Add any host-specific management/
+# test subnets here.
+excluded_source_ips = 127.0.0.0/8

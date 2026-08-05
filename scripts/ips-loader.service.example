@@ -10,15 +10,15 @@ Wants=network-online.target ips-threat-intel-update.timer ips-sni-blocklist-upda
 [Service]
 Type=simple
 # EDIT: path to the repo's build dir on this host
-WorkingDirectory=/home/raul/CLionProjects/Intrusion-Prevention-System/build
+WorkingDirectory=/path/to/Intrusion-Prevention-System/build
 # Builds br0 from wan_interface/lan_interface in config.ini before the daemon attaches XDP
 # to them -- without this, the two interfaces are never actually connected to each other at
 # the OS level (see setup_bridge.sh's own header comment). Runs on every start, not just
 # once, since it's idempotent and this doesn't persist across reboots on its own.
 # EDIT: path to the repo on this host
-ExecStartPre=/home/raul/CLionProjects/Intrusion-Prevention-System/scripts/setup_bridge.sh
+ExecStartPre=/path/to/Intrusion-Prevention-System/scripts/setup_bridge.sh
 # EDIT: matching path to the built binary
-ExecStart=/home/raul/CLionProjects/Intrusion-Prevention-System/build/fast_path/ips_loader
+ExecStart=/path/to/Intrusion-Prevention-System/build/fast_path/ips_loader
 Restart=on-failure
 RestartSec=5
 # Needs raw root to load BPF programs and attach XDP.
