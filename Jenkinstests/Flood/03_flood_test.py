@@ -17,9 +17,12 @@ import time
 
 from scapy.all import Ether, IP, UDP, sendp
 
-ATTACKER_IP = "10.200.0.66"   # spoofed source expected to get banned
-CONTROL_IP = "10.200.0.67"    # spoofed source that should NOT get banned
-VICTIM_IP = "10.200.0.1"      # enp0s8's address from 01_setup_veth.sh
+# Defaults match the veth harness (01_setup_veth.sh) so the Jenkins pipeline
+# keeps working unchanged; override via CLI flags to point this at real
+# hardware instead (e.g. a laptop's own IP as attacker, a phone's IP as victim).
+DEFAULT_ATTACKER_IP = "10.200.0.66"
+DEFAULT_CONTROL_IP = "10.200.0.67"
+DEFAULT_VICTIM_IP = "10.200.0.1"
 
 
 def flood(iface, src_ip, dst_ip, count, dst_port=53):
@@ -52,22 +55,28 @@ def main():
                      help="packets to fire from the attacker IP (default comfortably exceeds default thresholds)")
     ap.add_argument("--settle-seconds", type=float, default=2.0,
                      help="how long to wait for ips_loader to process the ban event")
+    ap.add_argument("--victim-ip", default=DEFAULT_VICTIM_IP,
+                     help="destination IP to flood (override for real-hardware testing)")
+    ap.add_argument("--attacker-ip", default=DEFAULT_ATTACKER_IP,
+                     help="source IP expected to get banned (spoofed on veth; use your real IP on real hardware)")
+    ap.add_argument("--control-ip", default=DEFAULT_CONTROL_IP,
+                     help="source IP expected to stay unbanned")
     args = ap.parse_args()
 
-    print(f"[*] Flooding {VICTIM_IP} from {ATTACKER_IP} via {args.iface} ({args.packets} packets, no delay)")
-    flood(args.iface, ATTACKER_IP, VICTIM_IP, args.packets)
+    print(f"[*] Flooding {args.victim_ip} from {args.attacker_ip} via {args.iface} ({args.packets} packets, no delay)")
+    flood(args.iface, args.attacker_ip, args.victim_ip, args.packets)
 
-    print(f"[*] Sending 5 control packets from {CONTROL_IP} (should stay unbanned)")
-    flood(args.iface, CONTROL_IP, VICTIM_IP, 5)
+    print(f"[*] Sending 5 control packets from {args.control_ip} (should stay unbanned)")
+    flood(args.iface, args.control_ip, args.victim_ip, 5)
 
     print(f"[*] Waiting {args.settle_seconds}s for ips_loader to process the ban event...")
     time.sleep(args.settle_seconds)
 
-    attacker_banned = ip_is_banned(args.blocklist_csv, ATTACKER_IP)
-    control_banned = ip_is_banned(args.blocklist_csv, CONTROL_IP)
+    attacker_banned = ip_is_banned(args.blocklist_csv, args.attacker_ip)
+    control_banned = ip_is_banned(args.blocklist_csv, args.control_ip)
 
-    print(f"[{'PASS' if attacker_banned else 'FAIL'}] Attacker IP {ATTACKER_IP} banned: {attacker_banned}")
-    print(f"[{'PASS' if not control_banned else 'FAIL'}] Control IP {CONTROL_IP} left alone: {not control_banned}")
+    print(f"[{'PASS' if attacker_banned else 'FAIL'}] Attacker IP {args.attacker_ip} banned: {attacker_banned}")
+    print(f"[{'PASS' if not control_banned else 'FAIL'}] Control IP {args.control_ip} left alone: {not control_banned}")
 
     sys.exit(0 if (attacker_banned and not control_banned) else 1)
 
