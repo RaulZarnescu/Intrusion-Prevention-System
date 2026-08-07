@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  jenkins:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ips_jenkins
+    privileged: false # Jenkins doesn't need privileges, just docker socket
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      # Mount the tarball into the container so entrypoint.sh can unpack it on first boot
+      - ./jenkins_state.tar.gz:/var/jenkins_home_init/jenkins_state.tar.gz:ro
+      # Allow docker-in-docker stages (like Flood Test)
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    networks:
+      - jenkins_net
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: ips_ngrok
+    depends_on:
+      - jenkins
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+    command:
+      - "http"
+      - "jenkins:8080"
+      - "--domain=clear-stowing-rebirth.ngrok-free.dev"
+    restart: unless-stopped
+    networks:
+      - jenkins_net
+
+volumes:
+  jenkins_home:
+    name: jenkins_home # Keep using the same volume name your pipeline mounts internally
+
+networks:
+  jenkins_net:
+    driver: bridge
