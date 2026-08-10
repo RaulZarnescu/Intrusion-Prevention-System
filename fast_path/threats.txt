@@ -1,5 +1,0 @@
-# Dummy OSINT Threat Feed
-# Designed to test the C parser
-
-# A blank line was above this
-1.2.3.4/32

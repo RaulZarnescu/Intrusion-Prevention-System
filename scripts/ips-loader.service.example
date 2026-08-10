@@ -19,6 +19,7 @@ WorkingDirectory=/path/to/Intrusion-Prevention-System/build
 ExecStartPre=/path/to/Intrusion-Prevention-System/scripts/setup_bridge.sh
 # EDIT: matching path to the built binary
 ExecStart=/path/to/Intrusion-Prevention-System/build/fast_path/ips_loader
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 # Needs raw root to load BPF programs and attach XDP.
