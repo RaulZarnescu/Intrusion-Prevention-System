@@ -19,8 +19,9 @@
 #include "ips_fast_common.h"
 #include "threat_intel.h"
 #include "main.h"
-#include "sni_blocklist.h"
-#include "doh_resolver_blocklist.h"
+#include "../local_analysis/sni_blocklist.h"
+#include "../local_analysis/doh_resolver_blocklist.h"
+#include "../local_analysis/recon_tracker.h"
 #include <signal.h>
 
 volatile sig_atomic_t keep_running = 1;
@@ -841,9 +842,19 @@ int main(int argc, char **argv) {
     struct ring_buffer *rb = NULL;
     rb = ring_buffer__new(bpf_map__fd(skel->maps.ban_events), handle_ban_event, &dynamic_bans_fd, NULL);
     if (!rb) {
-        fprintf(stderr, "[!] Failed to create ring buffer\n");
+        fprintf(stderr, "[!] Failed to create ban_events ring buffer\n");
         return EXIT_RINGBUF_FAILED;
     }
+    
+    struct recon_tracker_ctx recon_ctx = {
+        .dynamic_bans_fd = dynamic_bans_fd,
+        .threat_intel_fd = threat_intel_fd
+    };
+    if (ring_buffer__add(rb, bpf_map__fd(skel->maps.recon_events), handle_recon_event, &recon_ctx)) {
+        fprintf(stderr, "[!] Failed to add recon_events to ring buffer\n");
+        return EXIT_RINGBUF_FAILED;
+    }
+    
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     signal(SIGHUP, handle_sighup);
@@ -898,6 +909,9 @@ int main(int argc, char **argv) {
         // ====================================================================
 
         state_dump(tracker_fd, allowlist_fd, honeypot_fd, &current_config, current_time, &last_state_dump); // run per interval given by config file
+        
+        // Age the recon tracker (Token Regen)
+        age_recon_tracker(dynamic_bans_fd);
     }
 
     printf("\n[i] Shutting down gracefully. Freeing resources...\n");

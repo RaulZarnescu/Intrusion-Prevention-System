@@ -37,6 +37,7 @@ add_custom_target(ips_bpf_skeleton DEPENDS ${BPF_SKEL})
 # it links into the same binary since it shares the loader's BPF map fds directly.
 add_executable(ips_loader main.c threat_intel.c
     ${CMAKE_SOURCE_DIR}/local_analysis/sni_blocklist.c
+    ${CMAKE_SOURCE_DIR}/local_analysis/recon_tracker.c
     ${CMAKE_SOURCE_DIR}/local_analysis/doh_resolver_blocklist.c)
 add_dependencies(ips_loader ips_bpf_skeleton)
 target_compile_options(ips_loader PRIVATE -g)

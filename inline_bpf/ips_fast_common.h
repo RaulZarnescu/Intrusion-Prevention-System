@@ -20,7 +20,7 @@ struct ips_token_bucket {
 struct ips_blocklist_data {
     __u64 ban_timestamp;
     __u64 is_static;      // 0 = Auto-banned (Dynamic), 1 = Threat Intel (Permanent)
-    // is_static was made __64 from __8 to avoid padding
+    __u64 packets_dropped;
 };
 
 // Presence in the allowlist map means trusted; last_seen is refreshed on every packet
@@ -65,6 +65,18 @@ struct ips_ban_event {
 };
 
 // ==============================================================================
+// #REQ-074: Recon Events Stream
+// ==============================================================================
+#define PROTO_TCP 6
+#define PROTO_ICMP 1
+
+struct ips_recon_event {
+    __u32 src_ip;
+    __u16 dst_port;
+    __u8 protocol; // PROTO_TCP or PROTO_ICMP
+};
+
+// ==============================================================================
 // #REQ-XXX: Longest Prefix Match map
 // used for the blacklist to prevent overflow by attaching the whole subnet to an ip with a prefix
 //
@@ -105,7 +117,8 @@ struct flow_key {
     __u16 source_port;
     __u16 dest_port;
     __u8 protocol;
-    __u8 padding[3]; // Required to keep the struct 4-byte aligned for eBPF
+    __u8 tcp_flags;
+    __u8 padding[2]; // Required to keep the struct 4-byte aligned for eBPF
 };
 
 #define SNI_MAX_LEN 256

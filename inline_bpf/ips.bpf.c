@@ -102,6 +102,21 @@ struct {
     __uint(max_entries, 256 * 1024);
 } ban_events SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u32);
+    __type(value, __u8);
+    __uint(max_entries, 10240);
+} quarantine_map SEC(".maps");
+
+// ==============================================================================
+// #REQ-074: Recon Events Stream
+// ==============================================================================
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
+} recon_events SEC(".maps");
+
 volatile const __u32 burst_tokens = 50;
 volatile const __u32 max_tolerated_drops = 15;
 volatile const __u64 refill_interval_ns = 50000000ULL;
@@ -135,7 +150,23 @@ int ips_xdp_main(struct xdp_md *ctx) {
     if ((void *)(ip + 1) > data_end) return XDP_PASS;
 
     __u32 src_ip = ip->saddr;
+    __u32 dest_ip = ip->daddr;
     __u8 *action_flag;
+
+    // ====================================================
+    // STAGE 0.5: QUARANTINE & COMPROMISE DETECTION
+    // ====================================================
+    __u8 *quarantined = bpf_map_lookup_elem(&quarantine_map, &src_ip);
+    if (quarantined) {
+        return XDP_DROP; // Host is isolated!
+    }
+
+    struct ips_blocklist_data *dest_blocked = bpf_map_lookup_elem(&dynamic_bans_map, &dest_ip);
+    if (dest_blocked) {
+        __u8 val = 1;
+        bpf_map_update_elem(&quarantine_map, &src_ip, &val, BPF_ANY);
+        return XDP_DROP;
+    }
 
     // ====================================================
     // STAGE 1: BLOCKLIST
@@ -146,6 +177,7 @@ int ips_xdp_main(struct xdp_md *ctx) {
     // THE PACKET LOOKUP -- dynamic (rate-limit) bans first, then static/threat-intel
     struct ips_blocklist_data *blocked = bpf_map_lookup_elem(&dynamic_bans_map, &src_ip);
     if (blocked) {
+        __sync_fetch_and_add(&blocked->packets_dropped, 1);
         return XDP_DROP;
     }
 
@@ -155,6 +187,7 @@ int ips_xdp_main(struct xdp_md *ctx) {
 
     struct ips_blocklist_data *static_blocked = bpf_map_lookup_elem(&threat_intel_map, &search_key);
     if (static_blocked) {
+        __sync_fetch_and_add(&static_blocked->packets_dropped, 1);
         return XDP_DROP;
     }
 
@@ -236,6 +269,10 @@ int ips_xdp_main(struct xdp_md *ctx) {
         if ((void *)(tcp + 1) > data_end) return XDP_PASS;
         current_flow.source_port = tcp->source;
         current_flow.dest_port = tcp->dest;
+        
+        // Extract tcp flags (byte 13 of TCP header)
+        __u8 *tcp_bytes = (__u8 *)tcp;
+        current_flow.tcp_flags = tcp_bytes[13];
 
         if (tcp->dest == bpf_htons(443)) {
             bpf_tail_call(ctx, &jmp_table, PROG_IDX_TLS_PARSER);
@@ -334,6 +371,51 @@ int ips_xdp_main(struct xdp_md *ctx) {
                 reverse_flow.source_port = current_flow.dest_port;
                 reverse_flow.dest_port = current_flow.source_port;
                 bpf_map_update_elem(&allowlist, &reverse_flow, &trust, BPF_ANY);
+            }
+        }
+    }
+
+    // ====================================================
+    // STAGE 6: RECON TRACKER (PORT SNOOPING & PING SWEEPS)
+    // Runs after allowlist check to prevent false positives from internal IT.
+    // ====================================================
+    if (ip->protocol == IPPROTO_TCP && (current_flow.tcp_flags & 0x02) && !(current_flow.tcp_flags & 0x10)) { 
+        // SYN=1 (0x02), ACK=0 (0x10)
+        struct ips_recon_event *revent = bpf_ringbuf_reserve(&recon_events, sizeof(*revent), 0);
+        if (revent) {
+            revent->src_ip = ip->saddr;
+            revent->dst_port = bpf_ntohs(current_flow.dest_port);
+            revent->protocol = PROTO_TCP;
+            bpf_ringbuf_submit(revent, 0);
+        }
+    } else if (ip->protocol == IPPROTO_ICMP) {
+        // Need to include icmp header parsing
+        struct icmphdr {
+            __u8 type;
+            __u8 code;
+            __u16 checksum;
+            union {
+                struct {
+                    __u16 id;
+                    __u16 sequence;
+                } echo;
+                __u32 gateway;
+                struct {
+                    __u16 __unused;
+                    __u16 mtu;
+                } frag;
+            } un;
+        };
+        struct icmphdr *icmp = (void *)((__u8 *)ip + ip_hdr_len);
+        if ((void *)(icmp + 1) <= data_end) {
+            if (icmp->type == 8) { // Echo Request
+                struct ips_recon_event *revent = bpf_ringbuf_reserve(&recon_events, sizeof(*revent), 0);
+                if (revent) {
+                    revent->src_ip = ip->saddr;
+                    revent->dst_port = 0;
+                    revent->protocol = PROTO_ICMP;
+                    bpf_ringbuf_submit(revent, 0);
+                }
             }
         }
     }
