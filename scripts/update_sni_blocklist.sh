@@ -11,10 +11,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib_update_blocklist.sh"
 
-transform() { awk '/^[0-9]/{print $2}'; }
+transform() { tr -d '\r' | awk '/^[0-9]/{print $2}'; }
 
 run_update \
     "https://urlhaus.abuse.ch/downloads/hostfile/" \
     "$SCRIPT_DIR/../fast_path/sni_blocklist.txt" \
-    500 \
+    200 \
     '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
