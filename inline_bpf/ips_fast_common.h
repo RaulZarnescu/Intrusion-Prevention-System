@@ -55,6 +55,7 @@ struct ips_greylist_data {
 enum ips_ban_reason {
     IPS_BAN_REASON_RATE_LIMIT = 0,     // Token bucket exhausted (packet flood)
     IPS_BAN_REASON_MALFORMED_FLAGS = 1, // syn+fin / null scan / fin+psh+urg
+    IPS_BAN_REASON_MALICIOUS_SNI = 2,  // SNI blocked via BPF map
 };
 
 struct ips_ban_event {
@@ -105,6 +106,11 @@ struct flow_key {
     __u16 dest_port;
     __u8 protocol;
     __u8 padding[3]; // Required to keep the struct 4-byte aligned for eBPF
+};
+
+#define SNI_MAX_LEN 256
+struct sni_key {
+    char sni[SNI_MAX_LEN];
 };
 
 #endif /* IPS_FAST_COMMON_H */

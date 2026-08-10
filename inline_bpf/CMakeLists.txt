@@ -36,13 +36,11 @@ add_custom_target(ips_bpf_skeleton DEPENDS ${BPF_SKEL})
 # slow_path.c is the STAGE 2 (inline, real-time) sniffer thread main.c spawns per interface --
 # it links into the same binary since it shares the loader's BPF map fds directly.
 add_executable(ips_loader main.c threat_intel.c
-    ${CMAKE_SOURCE_DIR}/slow_path/slow_path.c
-    ${CMAKE_SOURCE_DIR}/slow_path/domain_set.c
-    ${CMAKE_SOURCE_DIR}/slow_path/sni_blocklist.c
-    ${CMAKE_SOURCE_DIR}/slow_path/doh_resolver_blocklist.c)
+    ${CMAKE_SOURCE_DIR}/local_analysis/sni_blocklist.c
+    ${CMAKE_SOURCE_DIR}/local_analysis/doh_resolver_blocklist.c)
 add_dependencies(ips_loader ips_bpf_skeleton)
 target_compile_options(ips_loader PRIVATE -g)
-target_include_directories(ips_loader PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/slow_path)
+target_include_directories(ips_loader PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/local_analysis)
 # Link the required eBPF libraries
 target_link_libraries(ips_loader bpf elf z)
 

@@ -3,5 +3,5 @@ project(Intrusion_Prevention_System)
 
 set(CMAKE_CXX_STANDARD 14)
 
-# Tell CMake to go look inside the fast_path folder and run the CMakeLists.txt there
-add_subdirectory(fast_path)
+# Tell CMake to go look inside the inline_bpf folder and run the CMakeLists.txt there
+add_subdirectory(inline_bpf)

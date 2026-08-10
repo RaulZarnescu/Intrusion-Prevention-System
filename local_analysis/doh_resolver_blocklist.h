@@ -6,7 +6,7 @@
 // is a policy list (are DNS-enforcement bypass attempts allowed on this LAN?), hand-curated
 // rather than fed by a threat-intel source, and a deployment may want one enforced without
 // the other.
-int load_doh_resolver_blocklist(const char *filepath);
+int load_doh_resolver_blocklist(const char *filepath, int doh_map_fd);
 int doh_resolver_blocklist_contains(const char *domain);
 
 #endif /* IPS_DOH_RESOLVER_BLOCKLIST_H */
