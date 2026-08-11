@@ -15,6 +15,6 @@ transform() { tr -d '\r' | awk '/^[0-9]/{print $2}'; }
 
 run_update \
     "https://urlhaus.abuse.ch/downloads/hostfile/" \
-    "$SCRIPT_DIR/../fast_path/sni_blocklist.txt" \
+    "$SCRIPT_DIR/../inline_bpf/sni_blocklist.txt" \
     200 \
     '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'

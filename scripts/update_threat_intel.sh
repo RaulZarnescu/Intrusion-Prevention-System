@@ -13,6 +13,6 @@ source "$SCRIPT_DIR/lib_update_blocklist.sh"
 
 run_update \
     "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/spamhaus_drop.netset" \
-    "$SCRIPT_DIR/../fast_path/threats.txt" \
+    "$SCRIPT_DIR/../inline_bpf/threats.txt" \
     100 \
     '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'
