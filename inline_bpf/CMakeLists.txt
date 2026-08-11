@@ -14,10 +14,19 @@ set(BPF_SRC ${CMAKE_CURRENT_SOURCE_DIR}/ips.bpf.c)
 set(BPF_OBJ ${CMAKE_CURRENT_BINARY_DIR}/ips_bpf.o)
 set(BPF_SKEL ${CMAKE_CURRENT_BINARY_DIR}/ips.skel.h)
 
+set(VMLINUX_H ${CMAKE_CURRENT_BINARY_DIR}/vmlinux.h)
+
+add_custom_command(
+    OUTPUT ${VMLINUX_H}
+    COMMAND sh -c "${BPFTOOL_BIN} btf dump file /sys/kernel/btf/vmlinux format c > ${VMLINUX_H}"
+    COMMENT "Generating vmlinux.h from kernel BTF"
+    VERBATIM
+)
+
 add_custom_command(
     OUTPUT ${BPF_OBJ}
-    COMMAND ${CLANG_BIN} -g -O2 -target bpf -I${CMAKE_CURRENT_SOURCE_DIR} -c ${BPF_SRC} -o ${BPF_OBJ}
-    DEPENDS ${BPF_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/vmlinux.h ${CMAKE_CURRENT_SOURCE_DIR}/ips_fast_common.h
+    COMMAND ${CLANG_BIN} -g -O2 -target bpf -I${CMAKE_CURRENT_BINARY_DIR} -I${CMAKE_CURRENT_SOURCE_DIR} -c ${BPF_SRC} -o ${BPF_OBJ}
+    DEPENDS ${BPF_SRC} ${VMLINUX_H} ${CMAKE_CURRENT_SOURCE_DIR}/ips_fast_common.h
     COMMENT "Compiling eBPF program ips.bpf.c -> ips_bpf.o"
     VERBATIM
 )
