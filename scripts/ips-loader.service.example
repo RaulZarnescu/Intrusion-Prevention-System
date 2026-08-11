@@ -18,7 +18,7 @@ WorkingDirectory=/path/to/Intrusion-Prevention-System/build
 # EDIT: path to the repo on this host
 ExecStartPre=/path/to/Intrusion-Prevention-System/scripts/setup_bridge.sh
 # EDIT: matching path to the built binary
-ExecStart=/path/to/Intrusion-Prevention-System/build/fast_path/ips_loader
+ExecStart=/path/to/Intrusion-Prevention-System/build/inline_bpf/ips_loader
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
