@@ -519,7 +519,9 @@ int tls_parser(struct xdp_md *ctx) {
                     #pragma unroll
                     for (int j = 0; j < SNI_MAX_LEN; j++) {
                         if (j >= name_len) break;
-                        key.sni[j] = payload[sp + j];
+                        int offset = sp + j;
+                        if (payload + offset + 1 > (__u8 *)data_end) break;
+                        key.sni[j] = payload[offset];
                     }
                     
                     __u8 *is_blocked = bpf_map_lookup_elem(&sni_blocklist_map, &key);
@@ -623,8 +625,10 @@ int dns_parser(struct xdp_md *ctx) {
         #pragma unroll
         for (int j = 0; j < 64; j++) {
             if (j >= label_len) break;
+            int offset = cur_pos + 1 + j;
+            if (payload + offset + 1 > (__u8 *)data_end) break;
             if (key_len < SNI_MAX_LEN - 1) {
-                key.sni[key_len++] = payload[cur_pos + 1 + j];
+                key.sni[key_len++] = payload[offset];
             }
         }
         
