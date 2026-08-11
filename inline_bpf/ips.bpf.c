@@ -120,6 +120,7 @@ struct {
 volatile const __u32 burst_tokens = 50;
 volatile const __u32 max_tolerated_drops = 15;
 volatile const __u64 refill_interval_ns = 50000000ULL;
+volatile const __u32 wan_ifindex = 0;
 
 //----------------------------------------------------------------------------------------------------------------------
 
@@ -152,6 +153,14 @@ int ips_xdp_main(struct xdp_md *ctx) {
     __u32 src_ip = ip->saddr;
     __u32 dest_ip = ip->daddr;
     __u8 *action_flag;
+
+    // ====================================================
+    // STAGE 0.1: ANTI-SPOOFING (BCP38) - #REQ-075
+    // ====================================================
+    // If the packet arrived on the WAN interface, it MUST NOT have an internal source IP.
+    if (wan_ifindex > 0 && ctx->ingress_ifindex == wan_ifindex && is_internal_ip(src_ip)) {
+        return XDP_DROP;
+    }
 
     // ====================================================
     // STAGE 0.5: QUARANTINE & COMPROMISE DETECTION
@@ -274,14 +283,8 @@ int ips_xdp_main(struct xdp_md *ctx) {
         __u8 *tcp_bytes = (__u8 *)tcp;
         current_flow.tcp_flags = tcp_bytes[13];
 
-        if (tcp->dest == bpf_htons(443)) {
-            bpf_tail_call(ctx, &jmp_table, PROG_IDX_TLS_PARSER);
-        } else if (tcp->dest == bpf_htons(80)) {
-            bpf_tail_call(ctx, &jmp_table, PROG_IDX_HTTP_PARSER);
-        }
-
         // ====================================================
-        // STAGE 2.5: MALFORMED TCP FLAGS
+        // STAGE 2.5: MALFORMED TCP FLAGS - #REQ-069
         // ====================================================
         if (is_malicious_tcp_flags(tcp)) {
             struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
@@ -306,9 +309,6 @@ int ips_xdp_main(struct xdp_md *ctx) {
         current_flow.source_port = udp->source;
         current_flow.dest_port = udp->dest;
 
-        if (udp->dest == bpf_htons(53)) {
-            bpf_tail_call(ctx, &jmp_table, PROG_IDX_DNS_PARSER);
-        }
     }
 
     // ====================================================
@@ -354,7 +354,7 @@ int ips_xdp_main(struct xdp_md *ctx) {
                 promote = 1;
             } else {
                 __u32 new_count = __sync_fetch_and_add(&grey->count, 1) + 1;
-                if (new_count >= 5) {
+                if (new_count >= 500) {
                     grey->authorized = 1;
                     promote = 1;
                     bpf_map_delete_elem(&ip_tracker, &src_ip);
@@ -420,6 +420,22 @@ int ips_xdp_main(struct xdp_md *ctx) {
         }
     }
 
+    // ====================================================
+    // STAGE 7: L7 DEEP PACKET INSPECTION (TAIL CALLS)
+    // Runs last so it doesn't bypass Allowlist and Recon trackers.
+    // ====================================================
+    if (ip->protocol == IPPROTO_TCP) {
+        if (current_flow.dest_port == bpf_htons(443)) {
+            bpf_tail_call(ctx, &jmp_table, PROG_IDX_TLS_PARSER);
+        } else if (current_flow.dest_port == bpf_htons(80)) {
+            bpf_tail_call(ctx, &jmp_table, PROG_IDX_HTTP_PARSER);
+        }
+    } else if (ip->protocol == IPPROTO_UDP) {
+        if (current_flow.dest_port == bpf_htons(53)) {
+            bpf_tail_call(ctx, &jmp_table, PROG_IDX_DNS_PARSER);
+        }
+    }
+
     return XDP_PASS;
 }
 
@@ -429,6 +445,7 @@ int ips_xdp_main(struct xdp_md *ctx) {
 #define TLS_SNI_HOST_NAME_TYPE     0x00
 
 SEC("xdp/tls_parser")
+// #REQ-058: L7 (SNI) Parser
 int tls_parser(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
     void *data = (void *)(long)ctx->data;
@@ -554,6 +571,7 @@ int tls_parser(struct xdp_md *ctx) {
 }
 
 SEC("xdp/dns_parser")
+// #REQ-058: L7 (DNS) Parser
 int dns_parser(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
     void *data = (void *)(long)ctx->data;

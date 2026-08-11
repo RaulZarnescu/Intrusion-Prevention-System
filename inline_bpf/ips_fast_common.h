@@ -126,4 +126,13 @@ struct sni_key {
     char sni[SNI_MAX_LEN];
 };
 
+static __always_inline int is_internal_ip(__u32 ip) {
+    // ip is in network byte order
+    __u8 *bytes = (__u8 *)&ip;
+    if (bytes[0] == 10) return 1;
+    if (bytes[0] == 172 && (bytes[1] >= 16 && bytes[1] <= 31)) return 1;
+    if (bytes[0] == 192 && bytes[1] == 168) return 1;
+    return 0;
+}
+
 #endif /* IPS_FAST_COMMON_H */

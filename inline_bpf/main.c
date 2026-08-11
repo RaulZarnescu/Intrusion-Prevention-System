@@ -428,6 +428,7 @@ static int load_skeleton(struct ips_bpf *skel, struct ips_config *config){
         return 1;
     }
 
+    skel->rodata->wan_ifindex = if_nametoindex(config->wan_interface);
     skel->rodata->burst_tokens = config->token_bucket_max;
     skel->rodata->max_tolerated_drops = config->max_tolerated_drops;
     if (config->token_refill_rate > 0) {
