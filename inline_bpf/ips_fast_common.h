@@ -105,6 +105,14 @@ struct ips_config {
     unsigned int state_dump_interval_sec; // How often the tracker/allowlist/honeypot CSVs are rewritten for monitor.py
     char wan_interface[16]; // matches IFNAMSIZ; upstream-facing physical interface (e.g. eth0)
     char lan_interface[16]; // matches IFNAMSIZ; internal-facing physical interface (e.g. eth1)
+    // Stage 0.1 BCP38 anti-spoof (ips_xdp_main): drops any WAN-arriving packet whose source
+    // looks like a private/RFC1918 address, on the assumption WAN means the real internet.
+    // That assumption breaks on a nested test rig where the "WAN" side is itself just
+    // another private LAN (e.g. a Tenda router's own 192.168.0.0/24) -- every legitimate
+    // packet from that side looks "internal" and gets silently dropped, no logging at all.
+    // Defaults on (correct for a real deployment); set anti_spoof_enabled = 0 in this
+    // host's local config.ini to disable it for exactly that kind of test topology.
+    unsigned int anti_spoof_enabled;
     // Source IPs/subnets exempt from the greylist bootstrap (e.g. the router's own bridged
     // traffic reflecting back) -- pushed into the excluded_srcs BPF map once at startup.
     struct lpm_ip_key excluded_srcs[MAX_EXCLUDED_SRCS];

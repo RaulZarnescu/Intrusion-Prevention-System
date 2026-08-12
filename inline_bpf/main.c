@@ -117,6 +117,7 @@ static void load_config(const char *filename, struct ips_config *config) {
     config->state_dump_interval_sec = 5;
     config->wan_interface[0] = '\0';
     config->lan_interface[0] = '\0';
+    config->anti_spoof_enabled = 1;
     // Default: the router's own bridged traffic reflecting back, plus loopback -- otherwise
     // the greylist bootstrap in ips_xdp_main() would trust flows that never actually
     // crossed the monitored interface. Overridable via excluded_source_ips in config.ini.
@@ -186,6 +187,10 @@ static void load_config(const char *filename, struct ips_config *config) {
             else if (strcmp(key, "state_dump_interval_seconds") == 0) {
                 config->state_dump_interval_sec = (unsigned int)parsed_val;
                 fprintf(stdout, "State Dump Interval: %u seconds\n", config->state_dump_interval_sec);
+            }
+            else if (strcmp(key, "anti_spoof_enabled") == 0) {
+                config->anti_spoof_enabled = (unsigned int)parsed_val;
+                fprintf(stdout, "Anti-Spoof (BCP38): %s\n", config->anti_spoof_enabled ? "enabled" : "DISABLED");
             }
         }
     }
@@ -428,7 +433,12 @@ static int load_skeleton(struct ips_bpf *skel, struct ips_config *config){
         return 1;
     }
 
-    skel->rodata->wan_ifindex = if_nametoindex(config->wan_interface);
+    // Gated by anti_spoof_enabled, not by whether wan_interface resolves -- this only
+    // controls what ips_xdp_main's BCP38 check sees (ips.bpf.c: `wan_ifindex > 0` is its
+    // on/off switch). Actually attaching XDP to the WAN interface is unrelated and handled
+    // separately below via ifaces.wan_ifindex/resolve_interface(), so disabling this can't
+    // affect that attachment.
+    skel->rodata->wan_ifindex = config->anti_spoof_enabled ? if_nametoindex(config->wan_interface) : 0;
     skel->rodata->burst_tokens = config->token_bucket_max;
     skel->rodata->max_tolerated_drops = config->max_tolerated_drops;
     if (config->token_refill_rate > 0) {

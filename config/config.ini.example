@@ -18,3 +18,9 @@ lan_interface = eth1
 # bridged traffic reflecting back, plus loopback). Add any host-specific management/
 # test subnets here.
 excluded_source_ips = 127.0.0.0/8
+# BCP38 anti-spoof (Stage 0.1): drops any WAN-arriving packet whose source looks
+# private/RFC1918, on the assumption WAN means the real internet. Leave this at 1 for
+# a real deployment. Set to 0 only on a nested test rig where the "WAN" side is itself
+# just another private LAN (e.g. behind a home router) -- otherwise every legitimate
+# packet from that side looks "internal" and gets silently dropped.
+anti_spoof_enabled = 1
