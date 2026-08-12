@@ -444,11 +444,199 @@ int ips_xdp_main(struct xdp_md *ctx) {
 #define TLS_EXT_SERVER_NAME        0x0000
 #define TLS_SNI_HOST_NAME_TYPE     0x00
 
-SEC("xdp/tls_parser")
-// #REQ-058: L7 (SNI) Parser
+SEC("xdp")
+// #REQ-058: L7 (TLS/SNI) Parser — redesigned to use bpf_xdp_load_bytes().
+//
+// Why: the previous implementation used a running `int pos` accumulator updated with
+// runtime-variable values (session_id_len, cipher_suites_len, ext_len) then masked
+// with `& 0x3FFF` before each dereference.  The BPF verifier rejects this because
+// after `pos += ext_len` (an unbounded runtime value) the pos range blows up and any
+// subsequent `payload + pos` dereference triggers "offset is outside of the packet".
+//
+// Fix: bpf_xdp_load_bytes(ctx, numeric_offset, local_buf, size) takes a plain __u32
+// offset and copies bytes into a stack buffer.  The verifier does NOT need to prove
+// the offset is in-bounds — the helper does that at runtime, returning < 0 on error.
+// We check the return value and bail.  No variable-offset pointer arithmetic at all.
+//
+// Exit semantics:
+//   XDP_PASS  — packet is not a TLS ClientHello (data record, ACK, alert, etc.)
+//   XDP_PASS  — well-formed ClientHello, SNI not in blocklist
+//   XDP_DROP  — packet positively identified as a ClientHello but structurally
+//               malformed (truncated mid-field, field value outside RFC 5246 limits).
+//               Blocks evasion via crafted malformed handshakes.
+//   XDP_DROP  — SNI matches sni_blocklist_map or doh_blocklist_map → ban + event
 int tls_parser(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
-    void *data = (void *)(long)ctx->data;
+    void *data     = (void *)(long)ctx->data;
+    __u32 pkt_len  = (__u32)(data_end - data);
+
+    // Fixed-size headers: safe pointer arithmetic (compile-time struct sizes)
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) return XDP_PASS;
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) return XDP_PASS;
+
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end) return XDP_PASS;
+    __u32 ip_hdr_len = ip->ihl * 4;
+    if (ip_hdr_len < sizeof(struct iphdr)) return XDP_PASS;
+    if (ip->protocol != IPPROTO_TCP) return XDP_PASS;
+
+    struct tcphdr *tcp = (void *)((__u8 *)ip + ip_hdr_len);
+    if ((void *)(tcp + 1) > data_end) return XDP_PASS;
+    __u32 tcp_hdr_len = tcp->doff * 4;
+    if (tcp_hdr_len < sizeof(struct tcphdr)) return XDP_PASS;
+
+    // payload_off: plain integer offset, NOT a pointer derived from data.
+    // bpf_xdp_load_bytes uses this as a numeric index and validates it internally.
+    __u32 payload_off = ((__u8 *)tcp - (__u8 *)data) + tcp_hdr_len;
+
+    // --- TLS Record Header: content_type(1) + version(2) + length(2) = 5 bytes ---
+    // Not a handshake record → normal TLS data/alert, pass silently.
+    __u8 tls_type;
+    if (bpf_xdp_load_bytes(ctx, payload_off, &tls_type, 1) < 0) return XDP_PASS;
+    if (tls_type != TLS_HANDSHAKE_CONTENT_TYPE) return XDP_PASS;
+
+    // --- Handshake type byte at offset +5 ---
+    __u8 hs_type;
+    if (bpf_xdp_load_bytes(ctx, payload_off + 5, &hs_type, 1) < 0) return XDP_PASS;
+    if (hs_type != TLS_CLIENT_HELLO_TYPE) return XDP_PASS;
+
+    // Packet has positively identified as a TLS ClientHello.
+    // Any structural failure from here on is DROP (malformed or evasion attempt).
+    //
+    // ClientHello memory layout (offsets from payload_off):
+    //   [0]      TLS record content_type  (verified above)
+    //   [1..2]   TLS record version
+    //   [3..4]   TLS record length
+    //   [5]      Handshake type           (verified above)
+    //   [6..8]   Handshake length (3 bytes)
+    //   [9..10]  ClientHello version
+    //   [11..42] Random (32 bytes)
+    //   [43]     session_id_length        ← pos starts here
+    __u32 pos = payload_off + 43;
+
+    __u8 session_id_len;
+    if (bpf_xdp_load_bytes(ctx, pos, &session_id_len, 1) < 0) return XDP_DROP;
+    if (session_id_len > 32) return XDP_DROP;  // RFC 5246 §7.4.1.2 hard limit
+    pos += 1 + (__u32)session_id_len;
+
+    __u8 cs_len_buf[2];
+    if (bpf_xdp_load_bytes(ctx, pos, cs_len_buf, 2) < 0) return XDP_DROP;
+    __u32 cipher_suites_len = ((__u32)cs_len_buf[0] << 8) | cs_len_buf[1];
+    if (cipher_suites_len > 512) return XDP_DROP;  // 512 B = 256 suites; pathological beyond that
+    pos += 2 + cipher_suites_len;
+
+    __u8 comp_len;
+    if (bpf_xdp_load_bytes(ctx, pos, &comp_len, 1) < 0) return XDP_DROP;
+    if (comp_len > 16) return XDP_DROP;  // Practically always 1 (null compression only)
+    pos += 1 + (__u32)comp_len;
+
+    // Extensions total length — may be absent in bare TLS 1.2 without extensions → pass.
+    __u8 ext_total_buf[2];
+    if (bpf_xdp_load_bytes(ctx, pos, ext_total_buf, 2) < 0) return XDP_PASS;
+    pos += 2;
+
+    __u32 src_ip = ip->saddr;
+
+    // Phase 1: scan extensions to locate the SNI extension.
+    // We only record its offset here — no name_len, no barrier_var inside the loop.
+    // Keeping the loop body simple (no opaque scalars) prevents verifier state explosion.
+    __u32 sni_pos = 0;  // offset of the SNI extension data (0 = not found)
+
+    #pragma unroll
+    for (int i = 0; i < 10; i++) {
+        __u8 ext_hdr[4];
+        if (bpf_xdp_load_bytes(ctx, pos, ext_hdr, 4) < 0) break;
+
+        __u32 ext_type = ((__u32)ext_hdr[0] << 8) | ext_hdr[1];
+        __u32 ext_len  = ((__u32)ext_hdr[2] << 8) | ext_hdr[3];
+        pos += 4;
+
+        if (ext_type == TLS_EXT_SERVER_NAME) {
+            sni_pos = pos;
+            break;
+        }
+
+        // Bound ext_len to prevent unbounded pos accumulation across iterations.
+        // A legitimate TLS extension body is never > 2048 bytes; anything larger
+        // is either malformed or a crafted evasion attempt.
+        if (ext_len > 2048) return XDP_DROP;
+        pos += ext_len;
+    }
+
+    // Phase 2: if we found an SNI extension, parse and check it.
+    // This is straight-line code — no loops, so barrier_var(name_len) only
+    // affects one linear path. The verifier's state space stays manageable.
+    if (sni_pos == 0)
+        return XDP_PASS;  // No SNI extension → nothing to check
+
+    __u8 sni_hdr[5];
+    if (bpf_xdp_load_bytes(ctx, sni_pos, sni_hdr, 5) < 0) return XDP_DROP;
+
+    __u8  name_type = sni_hdr[2];
+    if (name_type != TLS_SNI_HOST_NAME_TYPE) return XDP_PASS;
+
+    // barrier_var: prevents the compiler from optimising the >= SNI_MAX_LEN check into
+    // a high-byte-only branch (if sni_hdr[3] != 0) which leaves name_len's verifier
+    // range at [0, 65535].  With the barrier, the compiler must emit a direct comparison
+    // on name_len itself, so the verifier narrows it to [1, SNI_MAX_LEN-1] = [1, 255].
+    __u32 name_len = ((__u32)sni_hdr[3] << 8) | sni_hdr[4];
+    barrier_var(name_len);
+    if (name_len == 0 || name_len >= SNI_MAX_LEN) return XDP_DROP;
+    // Verifier: name_len in [1, 255] <= sizeof(key.sni) = 256.
+
+    struct sni_key key = {0};
+    if (bpf_xdp_load_bytes(ctx, sni_pos + 5, key.sni, name_len) < 0)
+        return XDP_DROP;
+
+    __u8 *is_blocked = bpf_map_lookup_elem(&sni_blocklist_map, &key);
+    if (is_blocked) {
+        struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
+        if (bpf_map_update_elem(&dynamic_bans_map, &src_ip, &block_data, BPF_ANY) == 0) {
+            bpf_map_delete_elem(&ip_tracker, &src_ip);
+            struct ips_ban_event *event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
+            if (event) {
+                event->src_ip     = src_ip;
+                event->drop_count = 0;
+                event->reason     = IPS_BAN_REASON_MALICIOUS_SNI;
+                bpf_ringbuf_submit(event, 0);
+            }
+        }
+        return XDP_DROP;
+    }
+
+    __u8 *is_doh = bpf_map_lookup_elem(&doh_blocklist_map, &key);
+    if (is_doh) {
+        struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
+        if (bpf_map_update_elem(&dynamic_bans_map, &src_ip, &block_data, BPF_ANY) == 0) {
+            bpf_map_delete_elem(&ip_tracker, &src_ip);
+            struct ips_ban_event *event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
+            if (event) {
+                event->src_ip     = src_ip;
+                event->drop_count = 0;
+                event->reason     = IPS_BAN_REASON_MALICIOUS_SNI;
+                bpf_ringbuf_submit(event, 0);
+            }
+        }
+        return XDP_DROP;
+    }
+
+    return XDP_PASS;
+}
+
+SEC("xdp")
+// #REQ-058: L7 (DNS) Parser — redesigned to use bpf_xdp_load_bytes().
+//
+// Exit semantics:
+//   XDP_PASS  — not a DNS query (response, multi-question, or packet too short)
+//   XDP_DROP  — packet is a DNS query but QNAME is structurally malformed
+//               (truncated mid-label, label length > 63 per RFC 1035)
+//               Blocks evasion via oversized/crafted QNAME labels.
+//   XDP_DROP  — queried domain matches sni_blocklist_map → ban + event
+int dns_parser(struct xdp_md *ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data     = (void *)(long)ctx->data;
+    __u32 pkt_len  = (__u32)(data_end - data);
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
@@ -456,275 +644,258 @@ int tls_parser(struct xdp_md *ctx) {
 
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end) return XDP_PASS;
-    int ip_hdr_len = ip->ihl * 4;
+    __u32 ip_hdr_len = ip->ihl * 4;
     if (ip_hdr_len < sizeof(struct iphdr)) return XDP_PASS;
-
-    if (ip->protocol != IPPROTO_TCP) return XDP_PASS;
-
-    struct tcphdr *tcp = (void *)((__u8 *)ip + ip_hdr_len);
-    if ((void *)(tcp + 1) > data_end) return XDP_PASS;
-
-    int tcp_hdr_len = tcp->doff * 4;
-    if (tcp_hdr_len < sizeof(struct tcphdr)) return XDP_PASS;
-
-    __u8 *payload = (__u8 *)tcp + tcp_hdr_len;
-    
-    if (payload + 5 > (__u8 *)data_end) return XDP_PASS;
-    if (payload[0] != TLS_HANDSHAKE_CONTENT_TYPE) return XDP_PASS;
-
-    if (payload + 9 > (__u8 *)data_end) return XDP_PASS;
-    if (payload[5] != TLS_CLIENT_HELLO_TYPE) return XDP_PASS;
-
-    int pos = 9 + 2 + 32;
-    if (payload + pos + 1 > (__u8 *)data_end) return XDP_PASS;
-
-    int session_id_len = payload[pos];
-    pos += 1 + session_id_len;
-    if (payload + pos + 2 > (__u8 *)data_end) return XDP_PASS;
-
-    int cipher_suites_len = (payload[pos] << 8) | payload[pos + 1];
-    pos += 2 + cipher_suites_len;
-    if (payload + pos + 1 > (__u8 *)data_end) return XDP_PASS;
-
-    int compression_len = payload[pos];
-    pos += 1 + compression_len;
-    if (payload + pos + 2 > (__u8 *)data_end) return XDP_PASS;
-
-    int extensions_len = (payload[pos] << 8) | payload[pos + 1];
-    pos += 2;
-
-    #pragma unroll
-    for (int i = 0; i < 10; i++) {
-        // We use bitwise mask `& 0x3FFF` (max 16KB) on pos to appease BPF verifier bounds checking on loops
-        int cur_pos = pos & 0x3FFF; 
-        
-        if (payload + cur_pos + 4 > (__u8 *)data_end) break;
-        int ext_type = (payload[cur_pos] << 8) | payload[cur_pos + 1];
-        int ext_len = (payload[cur_pos + 2] << 8) | payload[cur_pos + 3];
-        pos = cur_pos + 4;
-
-        if (ext_type == TLS_EXT_SERVER_NAME) {
-            if (payload + pos + 5 > (__u8 *)data_end) break;
-            
-            int sp = pos + 2;
-            __u8 name_type = payload[sp];
-            int name_len = (payload[sp + 1] << 8) | payload[sp + 2];
-            sp += 3;
-
-            if (name_type == TLS_SNI_HOST_NAME_TYPE) {
-                if (name_len > 0 && name_len < SNI_MAX_LEN) {
-                    if (payload + sp + name_len > (__u8 *)data_end) break;
-                    
-                    struct sni_key key = {0};
-                    #pragma unroll
-                    for (int j = 0; j < SNI_MAX_LEN; j++) {
-                        if (j >= name_len) break;
-                        int offset = sp + j;
-                        if (payload + offset + 1 > (__u8 *)data_end) break;
-                        key.sni[j] = payload[offset];
-                    }
-                    
-                    __u8 *is_blocked = bpf_map_lookup_elem(&sni_blocklist_map, &key);
-                    if (is_blocked) {
-                        struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
-                        __u32 src_ip = ip->saddr;
-                        
-                        if (bpf_map_update_elem(&dynamic_bans_map, &src_ip, &block_data, BPF_ANY) == 0) {
-                            bpf_map_delete_elem(&ip_tracker, &src_ip);
-                            
-                            struct ips_ban_event *event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
-                            if (event) {
-                                event->src_ip = src_ip;
-                                event->drop_count = 0;
-                                event->reason = IPS_BAN_REASON_MALICIOUS_SNI;
-                                bpf_ringbuf_submit(event, 0);
-                            }
-                        }
-                        return XDP_DROP;
-                    }
-
-                    __u8 *is_doh = bpf_map_lookup_elem(&doh_blocklist_map, &key);
-                    if (is_doh) {
-                        struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
-                        __u32 src_ip = ip->saddr;
-                        
-                        if (bpf_map_update_elem(&dynamic_bans_map, &src_ip, &block_data, BPF_ANY) == 0) {
-                            bpf_map_delete_elem(&ip_tracker, &src_ip);
-                            
-                            struct ips_ban_event *event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
-                            if (event) {
-                                event->src_ip = src_ip;
-                                event->drop_count = 0;
-                                event->reason = IPS_BAN_REASON_MALICIOUS_SNI;
-                                bpf_ringbuf_submit(event, 0);
-                            }
-                        }
-                        return XDP_DROP;
-                    }
-                }
-            }
-            break;
-        }
-        
-        pos += ext_len;
-    }
-    
-    return XDP_PASS;
-}
-
-SEC("xdp/dns_parser")
-// #REQ-058: L7 (DNS) Parser
-int dns_parser(struct xdp_md *ctx) {
-    void *data_end = (void *)(long)ctx->data_end;
-    void *data = (void *)(long)ctx->data;
-
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end) return XDP_PASS;
-
-    struct iphdr *ip = (void *)(eth + 1);
-    if ((void *)(ip + 1) > data_end) return XDP_PASS;
-    int ip_hdr_len = ip->ihl * 4;
+    if (ip->protocol != IPPROTO_UDP) return XDP_PASS;
 
     struct udphdr *udp = (void *)((__u8 *)ip + ip_hdr_len);
     if ((void *)(udp + 1) > data_end) return XDP_PASS;
 
-    __u8 *payload = (__u8 *)(udp + 1);
-    
-    // DNS Header is 12 bytes
-    if (payload + 12 > (__u8 *)data_end) return XDP_PASS;
-    
-    // Check if it's a query (QR == 0). Byte 2 bit 7 is QR.
-    if (payload[2] & 0x80) return XDP_PASS; // It's a response
-    
-    // Check QDCOUNT (Question Count)
-    int qdcount = (payload[4] << 8) | payload[5];
-    if (qdcount != 1) return XDP_PASS; // Only parse standard single queries
-    
-    int pos = 12;
-    struct sni_key key = {0}; // Reusing sni_key struct for DNS names
-    int key_len = 0;
-    
+    __u32 payload_off = ((__u8 *)udp - (__u8 *)data) + sizeof(struct udphdr);
+
+    // DNS header is 12 bytes; packet too short → pass (let the kernel handle it)
+    if (payload_off + 12 > pkt_len) return XDP_PASS;
+    __u8 dns_hdr[12];
+    if (bpf_xdp_load_bytes(ctx, payload_off, dns_hdr, 12) < 0) return XDP_PASS;
+
+    if (dns_hdr[2] & 0x80) return XDP_PASS;  // QR=1: DNS response, not a query
+
+    __u16 qdcount = ((__u16)dns_hdr[4] << 8) | dns_hdr[5];
+    if (qdcount != 1) return XDP_PASS;  // Multi-question DNS is unusual; skip safely
+
+    // QNAME starts immediately after the 12-byte DNS header.
+    // From here, the packet is a single-question DNS query.
+    // Structural failures (truncated label, label_len > 63) → DROP.
+    __u32 pos = payload_off + 12;
+
+    // Flat single loop — no nested loops, no variable-offset stack writes.
+    //
+    // Why flat?  The previous design had nested (outer-label × inner-char) loops.
+    // The inner character loop could not be fully unrolled (llen is a runtime value),
+    // leaving a real back-edge that the verifier traced for every distinct key_len
+    // value (0…63 per label × 10 labels = hundreds of states) → -E2BIG.
+    //
+    // With #pragma unroll on a single 253-iteration loop, the compiler emits 253
+    // distinct loop bodies.  Crucially, each body uses key.sni[i] with i being a
+    // compile-time constant, so NO variable-offset stack write ever occurs.
+    // All bpf_xdp_load_bytes calls have constant size=1, and the remaining/in-label
+    // tracking uses simple scalar registers that the verifier can track trivially.
+    //
+    // DNS name max is 253 printable chars (RFC 1035 §2.3.4: 255 wire bytes minus
+    // two length-octets for the smallest non-trivial label).
+    struct sni_key key = {0};
+    __u32 remaining = 0;  // Characters still to read in the current label
+    __u32 key_len   = 0;  // Bytes written to key.sni so far
+    __u8  valid     = 1;  // Stays 1 until we see the root label (llen==0)
+
     #pragma unroll
-    for (int i = 0; i < 10; i++) { // Max 10 labels
-        int cur_pos = pos & 0x3FFF;
-        if (payload + cur_pos + 1 > (__u8 *)data_end) break;
-        
-        int label_len = payload[cur_pos];
-        if (label_len == 0) break; // End of QNAME
-        
-        // Pointers not supported in simple QNAME parser
-        if (label_len >= 192) break; 
-        
-        if (payload + cur_pos + 1 + label_len > (__u8 *)data_end) break;
-        
-        // Append dot if not the first label
-        if (key_len > 0 && key_len < SNI_MAX_LEN) {
-            key.sni[key_len++] = '.';
-        }
-        
-        #pragma unroll
-        for (int j = 0; j < 64; j++) {
-            if (j >= label_len) break;
-            int offset = cur_pos + 1 + j;
-            if (payload + offset + 1 > (__u8 *)data_end) break;
-            if (key_len < SNI_MAX_LEN - 1) {
-                key.sni[key_len++] = payload[offset];
+    for (int i = 0; i < 253; i++) {
+        if (!valid) break;
+
+        __u8 c;
+        if (bpf_xdp_load_bytes(ctx, pos + i, &c, 1) < 0) return XDP_DROP;
+
+        if (remaining == 0) {
+            // This byte is a label length.
+            if (c == 0) {
+                // Root label: QNAME complete.
+                valid = 0;
+                break;
             }
+            if ((c & 0xC0) == 0xC0) {
+                // Compression pointer — stop here, treat as complete.
+                valid = 0;
+                break;
+            }
+            if (c > 63) return XDP_DROP;  // RFC 1035 hard limit: label ≤ 63 chars
+
+            remaining = c;
+
+            // Insert '.' separator between labels (not before the first).
+            if (key_len > 0 && key_len < SNI_MAX_LEN - 1) {
+                // key_len is guaranteed < SNI_MAX_LEN-1 by the check above, and i
+                // is a compile-time constant so key.sni[i] is a fixed stack slot.
+                // We use key_len as a runtime check, but write into key.sni[key_len]
+                // ONLY if key_len < SNI_MAX_LEN-1; the verifier sees this as safe.
+                // Note: this is the ONE remaining variable-offset write.  It is safe
+                // because we prove key_len < SNI_MAX_LEN-1 with the if() above.
+                // To keep it verifier-friendly we cap it with & (SNI_MAX_LEN-1).
+                __u32 kl = key_len & (SNI_MAX_LEN - 1);
+                ((char *)key.sni)[kl] = '.';
+                key_len++;
+            }
+        } else {
+            // This byte is a label character.
+            if (key_len < SNI_MAX_LEN - 1) {
+                __u32 kl = key_len & (SNI_MAX_LEN - 1);
+                ((char *)key.sni)[kl] = (char)c;
+                key_len++;
+            }
+            remaining--;
         }
-        
-        pos = cur_pos + 1 + label_len;
     }
-    
+
     if (key_len > 0) {
+        __u32 src_ip = ip->saddr;
+
         __u8 *is_blocked = bpf_map_lookup_elem(&sni_blocklist_map, &key);
         if (is_blocked) {
             struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
-            __u32 src_ip = ip->saddr;
-            
             if (bpf_map_update_elem(&dynamic_bans_map, &src_ip, &block_data, BPF_ANY) == 0) {
                 bpf_map_delete_elem(&ip_tracker, &src_ip);
-                
                 struct ips_ban_event *event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
                 if (event) {
-                    event->src_ip = src_ip;
+                    event->src_ip     = src_ip;
                     event->drop_count = 0;
-                    event->reason = IPS_BAN_REASON_MALICIOUS_SNI;
+                    event->reason     = IPS_BAN_REASON_MALICIOUS_SNI;
                     bpf_ringbuf_submit(event, 0);
                 }
             }
             return XDP_DROP;
         }
     }
-    
+
     return XDP_PASS;
 }
 
-SEC("xdp/http_parser")
+SEC("xdp")
+// L7 (HTTP) Parser — redesigned to use bpf_xdp_load_bytes().
+//
+// Strategy: load the first N bytes of HTTP payload into a local stack buffer, then
+// scan entirely from that buffer.  All subsequent access is plain array indexing on
+// a stack object — zero packet pointer arithmetic, zero verifier complaints.
+//
+// Exit semantics:
+//   XDP_PASS  — payload too short, or "Host:" not found in the inspected window
+//   XDP_DROP  — "Host:" found and hostname matches sni_blocklist_map → ban + event
 int http_parser(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
-    void *data = (void *)(long)ctx->data;
+    void *data     = (void *)(long)ctx->data;
+    __u32 pkt_len  = (__u32)(data_end - data);
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) return XDP_PASS;
 
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end) return XDP_PASS;
-    int ip_hdr_len = ip->ihl * 4;
+    __u32 ip_hdr_len = ip->ihl * 4;
+    if (ip_hdr_len < sizeof(struct iphdr)) return XDP_PASS;
+    if (ip->protocol != IPPROTO_TCP) return XDP_PASS;
 
     struct tcphdr *tcp = (void *)((__u8 *)ip + ip_hdr_len);
     if ((void *)(tcp + 1) > data_end) return XDP_PASS;
-    int tcp_hdr_len = tcp->doff * 4;
+    __u32 tcp_hdr_len = tcp->doff * 4;
+    if (tcp_hdr_len < sizeof(struct tcphdr)) return XDP_PASS;
 
-    __u8 *payload = (__u8 *)tcp + tcp_hdr_len;
-    if (payload >= (__u8 *)data_end) return XDP_PASS;
+    __u32 payload_off = ((__u8 *)tcp - (__u8 *)data) + tcp_hdr_len;
 
-    int payload_len = (__u8 *)data_end - payload;
-    if (payload_len < 16) return XDP_PASS; // Minimum size for HTTP header
+    // Bound-check directly on `avail` (the value actually fed to bpf_xdp_load_bytes
+    // below), not on a derived temporary like `payload_off + 16 > pkt_len`. The
+    // latter ties the [16, pkt_len] guarantee to a dead scratch register that's
+    // unrelated to `avail` as far as the verifier's precision tracking is
+    // concerned once a few more instructions separate them -- depending on
+    // whatever else changes in this function's codegen, that relation can get
+    // lost, leaving avail's proven lower bound at 0 instead of 16 and tripping
+    // "invalid zero-sized read" on the helper call. Checking `avail` itself here
+    // keeps the fact live on the exact register that needs it.
+    if (payload_off > pkt_len) return XDP_PASS;  // guards the subtraction below
+    __u32 avail = pkt_len - payload_off;
+    if (avail < 16) return XDP_PASS;
 
-    // Extremely basic Host: extraction for unencrypted HTTP
+    // Load up to 200 bytes of HTTP payload onto the stack.
+    // After this call, ALL parsing is pure stack array access — no derived pointers.
+    __u8 http_buf[200];
+    __builtin_memset(http_buf, 0, sizeof(http_buf));
+
+    __u32 load_len = (avail < sizeof(http_buf)) ? avail : sizeof(http_buf);
+    if (bpf_xdp_load_bytes(ctx, payload_off, http_buf, load_len) < 0) return XDP_PASS;
+
     struct sni_key key = {0};
     int key_len = 0;
-    int found_host = 0;
+
+    // Flat single-pass scan for "Host: <value>", mirroring dns_parser's design
+    // above: one fully-unrolled loop over the buffer with a small state variable
+    // driving per-byte behaviour, instead of a search loop followed by (or
+    // nesting) a copy loop.
+    //
+    // Every two-loop shape tried here first hit the same wall from a different
+    // angle: a search loop that finds a delimiter and THEN feeds a separate
+    // ~256-iteration copy loop forces the verifier to re-walk the copy loop once
+    // per distinct way the search could exit (once per unrolled match position,
+    // or once per distinct value/range the search loop's exit state carries) --
+    // multiplicative, and it blew straight through the 1M instruction budget
+    // (E2BIG) every time, no matter which side of the pair got unrolled. A single
+    // flat loop has no second entry point for the verifier to re-explore: it's
+    // additive in the number of bytes scanned, period.
+    //
+    // match_pos tracks how many bytes of the literal "Host: " have matched
+    // consecutively (0..6); reaching 6 flips into copy mode. The pattern has no
+    // internal repeats, so on a mismatch it's always correct to restart at 1 if
+    // the current byte is 'H' (could be the start of a new match) or 0 otherwise
+    // -- no KMP-style overlap table needed for this specific 6-byte literal.
+    // Compared via if/else, not a lookup array or switch: a switch here made
+    // clang emit a jump table (landed in a new .rodata datasec) instead of
+    // unrolling, since a shared jump table can't be duplicated per unrolled
+    // copy -- #pragma unroll silently no-opped and left a real back-edge loop
+    // with runtime-tracked state, i.e. exactly the "hundreds of states -> E2BIG"
+    // trap described above dns_parser's own loop. Plain comparisons unroll fine.
+    //
+    // No load_len check in this loop at all -- confirmed in isolation that
+    // combining this two-state (search/collect) branch structure with ANY break
+    // condition that reads load_len (even OR'd with a literal constant, the
+    // shape that unblocks a single-state loop) makes clang silently refuse to
+    // unroll again. It doesn't need one anyway: http_buf was memset to 0 before
+    // the load, so every byte beyond what bpf_xdp_load_bytes actually copied in
+    // is '\0' -- which the search state never matches and the collect state
+    // already treats as end-of-value. The loop's own constant bound (194, well
+    // inside the 200-byte http_buf) is the only bound this needs.
+    int match_pos = 0;
+    int collecting = 0;
 
     #pragma unroll
-    for (int i = 0; i < 200; i++) {
-        if (payload + i + 6 > (__u8 *)data_end) break;
-        
-        // Look for "Host: "
-        if (payload[i] == 'H' && payload[i+1] == 'o' && 
-            payload[i+2] == 's' && payload[i+3] == 't' && 
-            payload[i+4] == ':' && payload[i+5] == ' ') {
-            
-            int host_start = i + 6;
-            
-            #pragma unroll
-            for (int j = 0; j < SNI_MAX_LEN; j++) {
-                if (payload + host_start + j + 1 > (__u8 *)data_end) break;
-                __u8 c = payload[host_start + j];
-                if (c == '\r' || c == '\n') break;
-                if (key_len < SNI_MAX_LEN - 1) {
-                    key.sni[key_len++] = c;
-                }
+    for (int i = 0; i < 194; i++) {
+        __u8 c = http_buf[i];
+
+        if (!collecting) {
+            __u8 want = (match_pos == 0) ? 'H' :
+                        (match_pos == 1) ? 'o' :
+                        (match_pos == 2) ? 's' :
+                        (match_pos == 3) ? 't' :
+                        (match_pos == 4) ? ':' : ' ';
+            if (c == want) {
+                match_pos++;
+                if (match_pos == 6) collecting = 1;
+            } else {
+                match_pos = (c == 'H') ? 1 : 0;
             }
-            found_host = 1;
-            break;
+        } else {
+            if (c == '\r' || c == '\n' || c == '\0') break;
+            if (key_len < SNI_MAX_LEN - 1) {
+                // Masked index (matches dns_parser's pattern): without it, clang's
+                // unroller if-converts adjacent guarded stores into a single
+                // branchless address computed with `|=`, which the verifier
+                // rejects (pointer ALU ops besides bounded ADD/SUB are illegal).
+                __u32 kl = key_len & (SNI_MAX_LEN - 1);
+                key.sni[kl] = c;
+                key_len++;
+                barrier_var(key_len);
+            }
         }
     }
 
-    if (found_host && key_len > 0) {
+    if (key_len > 0) {
+        __u32 src_ip = ip->saddr;
         __u8 *is_blocked = bpf_map_lookup_elem(&sni_blocklist_map, &key);
         if (is_blocked) {
             struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
-            __u32 src_ip = ip->saddr;
-            
             if (bpf_map_update_elem(&dynamic_bans_map, &src_ip, &block_data, BPF_ANY) == 0) {
                 bpf_map_delete_elem(&ip_tracker, &src_ip);
-                
                 struct ips_ban_event *event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
                 if (event) {
-                    event->src_ip = src_ip;
+                    event->src_ip     = src_ip;
                     event->drop_count = 0;
-                    event->reason = IPS_BAN_REASON_MALICIOUS_SNI;
+                    event->reason     = IPS_BAN_REASON_MALICIOUS_SNI;
                     bpf_ringbuf_submit(event, 0);
                 }
             }
