@@ -11,8 +11,8 @@
 #include "../inline_bpf/ips_fast_common.h"
 
 #define MAX_TRACKED_IPS 10240
-#define STARTING_TOKENS 10
-#define MAX_TOKENS 10
+#define STARTING_TOKENS 40
+#define MAX_TOKENS 40
 #define REGEN_SECONDS 300 // +1 token every 5 minutes
 #define BAN_SUBNET_THRESHOLD 3
 

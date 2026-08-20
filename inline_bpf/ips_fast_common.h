@@ -56,6 +56,9 @@ enum ips_ban_reason {
     IPS_BAN_REASON_RATE_LIMIT = 0,     // Token bucket exhausted (packet flood)
     IPS_BAN_REASON_MALFORMED_FLAGS = 1, // syn+fin / null scan / fin+psh+urg
     IPS_BAN_REASON_MALICIOUS_SNI = 2,  // SNI blocked via BPF map
+    IPS_BAN_REASON_PROTOCOL_MISMATCH = 3, // traffic on a well-known port didn't match that port's protocol
+    IPS_BAN_REASON_FRAGMENTED = 4,     // IP fragment -- likely header-splitting scan evasion (nmap -f)
+    IPS_BAN_REASON_OUT_OF_STATE_ACK = 5, // ACK/FIN-ACK with no prior SYN seen for this flow (ACK/Window/Maimon scan)
 };
 
 struct ips_ban_event {
@@ -103,6 +106,13 @@ struct ips_config {
     unsigned int threat_intel_refresh_sec; // Nominal cadence, used only for stale-entry TTL math (aged out past 2x this) -- re-injection itself is SIGHUP-driven, not polled
     unsigned int allowlist_ttl_sec; // How long a trusted flow survives with no traffic before it's aged out
     unsigned int state_dump_interval_sec; // How often the tracker/allowlist/honeypot CSVs are rewritten for monitor.py
+    // Stage 2.6 out-of-state-ACK detection (ips_xdp_main) needs a prior SYN recorded in
+    // conn_seen_map before it'll trust an ACK/FIN-ACK -- which conn_seen_map, freshly empty
+    // on every restart, can't have for connections that were already established before this
+    // restart (e.g. an existing SSH session into this very box). For this many seconds after
+    // startup, stage 2.6 doesn't enforce, so those survive; only after it elapses does an
+    // ACK/Window/Maimon scan actually get banned.
+    unsigned int conn_track_grace_period_sec;
     char wan_interface[16]; // matches IFNAMSIZ; upstream-facing physical interface (e.g. eth0)
     char lan_interface[16]; // matches IFNAMSIZ; internal-facing physical interface (e.g. eth1)
     // Stage 0.1 BCP38 anti-spoof (ips_xdp_main): drops any WAN-arriving packet whose source

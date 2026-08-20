@@ -115,6 +115,7 @@ static void load_config(const char *filename, struct ips_config *config) {
     config->threat_intel_refresh_sec = 86400;
     config->allowlist_ttl_sec = 900;
     config->state_dump_interval_sec = 5;
+    config->conn_track_grace_period_sec = 30;
     config->wan_interface[0] = '\0';
     config->lan_interface[0] = '\0';
     config->anti_spoof_enabled = 1;
@@ -191,6 +192,10 @@ static void load_config(const char *filename, struct ips_config *config) {
             else if (strcmp(key, "anti_spoof_enabled") == 0) {
                 config->anti_spoof_enabled = (unsigned int)parsed_val;
                 fprintf(stdout, "Anti-Spoof (BCP38): %s\n", config->anti_spoof_enabled ? "enabled" : "DISABLED");
+            }
+            else if (strcmp(key, "conn_track_grace_period_seconds") == 0) {
+                config->conn_track_grace_period_sec = (unsigned int)parsed_val;
+                fprintf(stdout, "Out-of-state ACK grace period: %u seconds\n", config->conn_track_grace_period_sec);
             }
         }
     }
@@ -391,6 +396,10 @@ static const char *ban_reason_to_str(__u32 reason) {
     switch (reason) {
         case IPS_BAN_REASON_RATE_LIMIT: return "rate limit exceeded";
         case IPS_BAN_REASON_MALFORMED_FLAGS: return "malformed TCP flags";
+        case IPS_BAN_REASON_MALICIOUS_SNI: return "malicious SNI/domain";
+        case IPS_BAN_REASON_PROTOCOL_MISMATCH: return "protocol mismatch on well-known port";
+        case IPS_BAN_REASON_FRAGMENTED: return "IP fragment (scan evasion)";
+        case IPS_BAN_REASON_OUT_OF_STATE_ACK: return "out-of-state ACK (ACK/Window/Maimon scan)";
         default: return "unknown reason";
     }
 }
@@ -445,6 +454,15 @@ static int load_skeleton(struct ips_bpf *skel, struct ips_config *config){
         skel->rodata->refill_interval_ns = 1000000000ULL / config->token_refill_rate;
     } else {
         skel->rodata->refill_interval_ns = 1000000000ULL;
+    }
+    {
+        // Same boot-monotonic clock domain as bpf_ktime_get_ns() (see monotonic_seconds()
+        // below) -- computed once, here, at attach time, so stage 2.6's grace period always
+        // starts from this process's actual startup, not some fixed/relative offset.
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        __u64 now_ns = (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
+        skel->rodata->grace_period_end_ns = now_ns + (__u64)config->conn_track_grace_period_sec * 1000000000ULL;
     }
     if (ips_bpf__load(skel)) {
         fprintf(stderr, "[!] FATAL: Failed to load BPF skeleton.\n");
@@ -817,6 +835,12 @@ int main(int argc, char **argv) {
     index = 2; // PROG_IDX_HTTP_PARSER
     if (bpf_map_update_elem(jmp_table_fd, &index, &http_prog_fd, BPF_ANY) != 0) {
         fprintf(stderr, "[!] Failed to bind HTTP parser to jmp_table: %s\n", strerror(errno));
+    }
+
+    int ssh_prog_fd = bpf_program__fd(skel->progs.ssh_parser);
+    index = 3; // PROG_IDX_SSH_PARSER
+    if (bpf_map_update_elem(jmp_table_fd, &index, &ssh_prog_fd, BPF_ANY) != 0) {
+        fprintf(stderr, "[!] Failed to bind SSH parser to jmp_table: %s\n", strerror(errno));
     }
 
     int tracker_fd = bpf_map__fd(skel->maps.ip_tracker);

@@ -43,6 +43,7 @@ struct {
 #define PROG_IDX_TLS_PARSER 0
 #define PROG_IDX_DNS_PARSER 1
 #define PROG_IDX_HTTP_PARSER 2
+#define PROG_IDX_SSH_PARSER 3
 
 // ==============================================================================
 // #REQ-009: Dynamic Blocklist Map (rate-limit bans, always a single /32 IP)
@@ -87,6 +88,33 @@ struct {
     __uint(max_entries, 65536);
 } greylist SEC(".maps");
 
+// #REQ-XXX: Port/protocol conformance ("first packet" tracking for http_parser/ssh_parser).
+// Presence means this flow's very first payload-bearing packet already ran the strict
+// request-line/banner check -- HTTP/SSH only guarantee their identifying shape on that one
+// packet (everything after is a body chunk, a second keep-alive request, or opaque encrypted
+// framing), so later packets skip re-checking instead of false-positiving on ordinary
+// multi-packet traffic. Keyed on struct flow_key but callers always zero .tcp_flags/.padding
+// before use -- unlike `allowlist` below, this must match the same flow regardless of which
+// packet (SYN/ACK/PSH/...) triggered the lookup.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, struct flow_key);
+    __type(value, __u8);
+    __uint(max_entries, 65536);
+} l7_seen_map SEC(".maps");
+
+// #REQ-XXX: Stage 2.6 out-of-state ACK detection (ACK/Window/Maimon scan). Presence means
+// a genuine SYN (SYN=1,ACK=0) was observed for this flow -- written for BOTH directions
+// (forward and reverse, same reasoning as `allowlist`'s promotion above) so the server's own
+// return traffic isn't mistaken for an out-of-state probe too. Keyed on struct flow_key with
+// .tcp_flags/.padding always zeroed by callers, same convention as l7_seen_map.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, struct flow_key);
+    __type(value, __u8);
+    __uint(max_entries, 131072);
+} conn_seen_map SEC(".maps");
+
 // Source IPs/subnets exempt from the greylist bootstrap, loaded once from config.ini's
 // excluded_source_ips at startup (main.c owns writes, same as threat_intel_map/injector.c).
 struct {
@@ -121,14 +149,23 @@ volatile const __u32 burst_tokens = 50;
 volatile const __u32 max_tolerated_drops = 15;
 volatile const __u64 refill_interval_ns = 50000000ULL;
 volatile const __u32 wan_ifindex = 0;
+// Boot-monotonic ns deadline (bpf_ktime_get_ns() domain) computed once at attach time in
+// main.c: now + conn_track_grace_period_sec. Before this, stage 2.6 doesn't enforce, so
+// connections already established when ips_loader restarts (this box's own SSH session
+// included) survive instead of getting banned for having no recorded SYN in the fresh map.
+volatile const __u64 grace_period_end_ns = 0;
 
 //----------------------------------------------------------------------------------------------------------------------
 
-// syn+fin, null scan, fin+psh+urg -- single-packet, stateless, no reassembly needed.
+// syn+fin, null scan, fin+psh+urg (xmas), bare fin (fin scan) -- single-packet, stateless,
+// no reassembly needed. Bare FIN is safe to flag unconditionally: once a connection is
+// established, a legitimate stack always sets ACK alongside FIN during teardown -- FIN
+// without ACK never happens in real traffic, only in nmap -sF style scans.
 static __always_inline int is_malicious_tcp_flags(const struct tcphdr *tcp) {
     return (tcp->syn && tcp->fin) ||
            (!tcp->syn && !tcp->ack && !tcp->fin && !tcp->rst && !tcp->psh && !tcp->urg) ||
-           (tcp->fin && tcp->psh && tcp->urg);
+           (tcp->fin && tcp->psh && tcp->urg) ||
+           (tcp->fin && !tcp->ack);
 }
 
 SEC("xdp")
@@ -155,6 +192,57 @@ int ips_xdp_main(struct xdp_md *ctx) {
     __u8 *action_flag;
 
     // ====================================================
+    // STAGE 0.05: IP FRAGMENTATION - #REQ-XXX
+    // ====================================================
+    // Every check downstream of this point (malformed-flags, port/protocol conformance,
+    // recon tracker, L7 parsers...) assumes the full L4 header is present in this one
+    // packet. `nmap -f`/`--mtu` defeats all of that at once by splitting the TCP header
+    // itself across two IP fragments: the first fragment can be crafted short enough to
+    // omit the flags byte (passes every bounds check below as "incomplete, not TCP"), and
+    // the trailing fragment has no L4 header at all to inspect. On this rig's single,
+    // uniform-MTU LAN, genuine fragmentation basically never happens for TCP -- PMTUD
+    // avoids it entirely -- so instead of the real fix (stateful reassembly, expensive and
+    // its own source of bugs), fragments are treated the same as any other structural
+    // attack signature already in this file: instant ban, same as Stage 2.5.
+    //
+    // Two sourced fixes to reach for if this blanket policy ever turns out to be a real
+    // problem (a legitimate host on this network that genuinely needs to fragment):
+    //   1. (implemented below) exempt specific sources via excluded_srcs -- same config.ini
+    //      excluded_source_ips list already used to exempt infra from Stage 0.5/5.
+    //   2. (not implemented) a real IP defragmentation engine: buffer fragments per
+    //      (src_ip, dst_ip, id) in a map, reassemble once all arrive, re-run this whole
+    //      pipeline against the reassembled packet. Correctly handles legitimate
+    //      fragmentation instead of just carving out exceptions for it, but is a
+    //      meaningfully bigger feature -- per-flow buffering, reassembly timeouts,
+    //      overlapping-fragment attacks (the classic teardrop/rose-fragment evasion class)
+    //      to guard against in the reassembly logic itself -- worth it only if exemption
+    //      lists prove to be too blunt in practice.
+    __u16 frag_info = bpf_ntohs(ip->frag_off);
+    __u16 frag_offset = frag_info & 0x1FFF;    // low 13 bits: offset in 8-byte units
+    int more_fragments = (frag_info & 0x2000) != 0; // bit 13: MF flag
+
+    if (frag_offset != 0 || more_fragments) {
+        struct lpm_ip_key frag_excl_key = { .prefixlen = 32, .ip = src_ip };
+        if (!bpf_map_lookup_elem(&excluded_srcs, &frag_excl_key)) {
+            struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
+            if (bpf_map_update_elem(&dynamic_bans_map, &src_ip, &block_data, BPF_ANY) == 0) {
+                bpf_map_delete_elem(&ip_tracker, &src_ip);
+                struct ips_ban_event *event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
+                if (event) {
+                    event->src_ip     = src_ip;
+                    event->drop_count = 0;
+                    event->reason     = IPS_BAN_REASON_FRAGMENTED;
+                    bpf_ringbuf_submit(event, 0);
+                }
+            }
+            return XDP_DROP;
+        }
+        // Excluded source: still can't be inspected (no full L4 header here), but skip the
+        // ban -- falls through to the rest of the pipeline like any other packet, which
+        // will itself PASS or DROP incomplete headers per each stage's own bounds checks.
+    }
+
+    // ====================================================
     // STAGE 0.1: ANTI-SPOOFING (BCP38) - #REQ-075
     // ====================================================
     // If the packet arrived on the WAN interface, it MUST NOT have an internal source IP.
@@ -165,16 +253,25 @@ int ips_xdp_main(struct xdp_md *ctx) {
     // ====================================================
     // STAGE 0.5: QUARANTINE & COMPROMISE DETECTION
     // ====================================================
-    __u8 *quarantined = bpf_map_lookup_elem(&quarantine_map, &src_ip);
-    if (quarantined) {
-        return XDP_DROP; // Host is isolated!
-    }
+    // Core network infrastructure (gateway, AP) is exempt: quarantine_map has no expiry
+    // (unlike dynamic_bans_map), so a single innocent packet from one of these devices toward
+    // a client that happens to be banned at that instant -- e.g. a DHCP renewal, or just a
+    // normal reply -- would otherwise silently and permanently quarantine the infrastructure
+    // device itself until the next service restart. Put the gateway/AP IPs in
+    // excluded_source_ips (config.ini) to cover this.
+    struct lpm_ip_key q_excl_key = { .prefixlen = 32, .ip = src_ip };
+    if (!bpf_map_lookup_elem(&excluded_srcs, &q_excl_key)) {
+        __u8 *quarantined = bpf_map_lookup_elem(&quarantine_map, &src_ip);
+        if (quarantined) {
+            return XDP_DROP; // Host is isolated!
+        }
 
-    struct ips_blocklist_data *dest_blocked = bpf_map_lookup_elem(&dynamic_bans_map, &dest_ip);
-    if (dest_blocked) {
-        __u8 val = 1;
-        bpf_map_update_elem(&quarantine_map, &src_ip, &val, BPF_ANY);
-        return XDP_DROP;
+        struct ips_blocklist_data *dest_blocked = bpf_map_lookup_elem(&dynamic_bans_map, &dest_ip);
+        if (dest_blocked) {
+            __u8 val = 1;
+            bpf_map_update_elem(&quarantine_map, &src_ip, &val, BPF_ANY);
+            return XDP_DROP;
+        }
     }
 
     // ====================================================
@@ -302,6 +399,38 @@ int ips_xdp_main(struct xdp_md *ctx) {
             }
             return XDP_DROP;
         }
+
+        // ====================================================
+        // STAGE 2.6: OUT-OF-STATE ACK - #REQ-XXX (ACK/Window/Maimon scan detection)
+        // ====================================================
+        // ACK/Window scans (-sA/-sW) and Maimon scans (-sM) send a bare ACK or FIN+ACK that
+        // never followed a real SYN -- flags alone can't tell that apart from a legitimate
+        // mid-connection packet (every real ACK looks exactly like this too), so this needs
+        // actual state: has this exact flow ever sent a SYN we saw? (recorded below in
+        // Stage 6, for both directions, so the server's own return traffic isn't mistaken
+        // for an out-of-state probe). Skipped during the post-restart grace period so
+        // connections already established before this ips_loader process started (this
+        // box's own SSH session included) aren't banned just for predating a freshly empty
+        // conn_seen_map.
+        if (tcp->ack && !tcp->syn && bpf_ktime_get_ns() >= grace_period_end_ns) {
+            struct flow_key seen_key = current_flow;
+            seen_key.tcp_flags = 0;
+
+            if (!bpf_map_lookup_elem(&conn_seen_map, &seen_key)) {
+                struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
+                if (bpf_map_update_elem(&dynamic_bans_map, &src_ip, &block_data, BPF_ANY) == 0) {
+                    bpf_map_delete_elem(&ip_tracker, &src_ip);
+                    struct ips_ban_event *event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
+                    if (event) {
+                        event->src_ip     = src_ip;
+                        event->drop_count = 0;
+                        event->reason     = IPS_BAN_REASON_OUT_OF_STATE_ACK;
+                        bpf_ringbuf_submit(event, 0);
+                    }
+                }
+                return XDP_DROP;
+            }
+        }
     }
     else if (ip->protocol == IPPROTO_UDP) {
         struct udphdr *udp = (void *)((__u8 *)ip + ip_hdr_len);
@@ -379,7 +508,7 @@ int ips_xdp_main(struct xdp_md *ctx) {
     // STAGE 6: RECON TRACKER (PORT SNOOPING & PING SWEEPS)
     // Runs after allowlist check to prevent false positives from internal IT.
     // ====================================================
-    if (ip->protocol == IPPROTO_TCP && (current_flow.tcp_flags & 0x02) && !(current_flow.tcp_flags & 0x10)) { 
+    if (ip->protocol == IPPROTO_TCP && (current_flow.tcp_flags & 0x02) && !(current_flow.tcp_flags & 0x10)) {
         // SYN=1 (0x02), ACK=0 (0x10)
         struct ips_recon_event *revent = bpf_ringbuf_reserve(&recon_events, sizeof(*revent), 0);
         if (revent) {
@@ -388,6 +517,22 @@ int ips_xdp_main(struct xdp_md *ctx) {
             revent->protocol = PROTO_TCP;
             bpf_ringbuf_submit(revent, 0);
         }
+
+        // Feeds Stage 2.6 (out-of-state ACK detection, above): a genuine SYN proves this
+        // flow's later ACKs are legitimate. Recorded for BOTH directions -- same reasoning
+        // as the allowlist promotion below -- so the server's own reply traffic (a
+        // different 5-tuple) isn't mistaken for an out-of-state probe too.
+        struct flow_key seen_key = current_flow;
+        seen_key.tcp_flags = 0;
+        __u8 seen_val = 1;
+        bpf_map_update_elem(&conn_seen_map, &seen_key, &seen_val, BPF_ANY);
+
+        struct flow_key seen_key_rev = seen_key;
+        seen_key_rev.source_ip   = seen_key.dest_ip;
+        seen_key_rev.dest_ip     = seen_key.source_ip;
+        seen_key_rev.source_port = seen_key.dest_port;
+        seen_key_rev.dest_port   = seen_key.source_port;
+        bpf_map_update_elem(&conn_seen_map, &seen_key_rev, &seen_val, BPF_ANY);
     } else if (ip->protocol == IPPROTO_ICMP) {
         // Need to include icmp header parsing
         struct icmphdr {
@@ -429,6 +574,8 @@ int ips_xdp_main(struct xdp_md *ctx) {
             bpf_tail_call(ctx, &jmp_table, PROG_IDX_TLS_PARSER);
         } else if (current_flow.dest_port == bpf_htons(80)) {
             bpf_tail_call(ctx, &jmp_table, PROG_IDX_HTTP_PARSER);
+        } else if (current_flow.dest_port == bpf_htons(22)) {
+            bpf_tail_call(ctx, &jmp_table, PROG_IDX_SSH_PARSER);
         }
     } else if (ip->protocol == IPPROTO_UDP) {
         if (current_flow.dest_port == bpf_htons(53)) {
@@ -491,10 +638,40 @@ int tls_parser(struct xdp_md *ctx) {
     __u32 payload_off = ((__u8 *)tcp - (__u8 *)data) + tcp_hdr_len;
 
     // --- TLS Record Header: content_type(1) + version(2) + length(2) = 5 bytes ---
-    // Not a handshake record → normal TLS data/alert, pass silently.
-    __u8 tls_type;
-    if (bpf_xdp_load_bytes(ctx, payload_off, &tls_type, 1) < 0) return XDP_PASS;
-    if (tls_type != TLS_HANDSHAKE_CONTENT_TYPE) return XDP_PASS;
+    // No payload at all (bare ACK, etc.) -- nothing to enforce, this is normal TCP traffic.
+    __u8 tls_hdr[3]; // content_type, version_major, version_minor
+    if (bpf_xdp_load_bytes(ctx, payload_off, tls_hdr, 3) < 0) return XDP_PASS;
+
+    __u8 content_type  = tls_hdr[0];
+    __u8 version_major = tls_hdr[1];
+
+    // #REQ-XXX: Port/protocol conformance. Every TLS record -- handshake, application_data,
+    // alert, change_cipher_spec, heartbeat -- carries this same 5-byte header shape on every
+    // single packet of the connection, not just the handshake. Unlike HTTP (see http_parser),
+    // that makes it cheap AND correct to enforce continuously: a non-TLS protocol tunneled
+    // over 443 (an SSH banner, raw C2 bytes, ...) fails this on every packet it ever sends,
+    // not just the first one, so there's no need for a per-flow "already checked" map here.
+    int looks_like_tls = version_major == 3 &&
+        (content_type == 20 || content_type == 21 || content_type == 22 ||
+         content_type == 23 || content_type == 24);
+
+    if (!looks_like_tls) {
+        __u32 src_ip = ip->saddr;
+        struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
+        if (bpf_map_update_elem(&dynamic_bans_map, &src_ip, &block_data, BPF_ANY) == 0) {
+            bpf_map_delete_elem(&ip_tracker, &src_ip);
+            struct ips_ban_event *event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
+            if (event) {
+                event->src_ip     = src_ip;
+                event->drop_count = 0;
+                event->reason     = IPS_BAN_REASON_PROTOCOL_MISMATCH;
+                bpf_ringbuf_submit(event, 0);
+            }
+        }
+        return XDP_DROP;
+    }
+
+    if (content_type != TLS_HANDSHAKE_CONTENT_TYPE) return XDP_PASS; // valid TLS record, just not a ClientHello -- nothing more to inspect
 
     // --- Handshake type byte at offset +5 ---
     __u8 hs_type;
@@ -811,6 +988,51 @@ int http_parser(struct xdp_md *ctx) {
     __u32 load_len = (avail < sizeof(http_buf)) ? avail : sizeof(http_buf);
     if (bpf_xdp_load_bytes(ctx, payload_off, http_buf, load_len) < 0) return XDP_PASS;
 
+    // #REQ-XXX: Port/protocol conformance -- only on this flow's first payload-bearing
+    // packet, since that's the only place a genuine HTTP request line is guaranteed to
+    // appear. A non-HTTP protocol tunneled over port 80 (SSH, raw C2, ...) fails this on
+    // its very first byte. A large POST body or a keep-alive connection's later packets
+    // are exempt via l7_seen_map -- those legitimately don't start with a verb, and
+    // checking every packet the way tls_parser does would false-positive on them.
+    struct flow_key l7_key = {0};
+    l7_key.source_ip   = ip->saddr;
+    l7_key.dest_ip     = ip->daddr;
+    l7_key.source_port = tcp->source;
+    l7_key.dest_port   = tcp->dest;
+    l7_key.protocol    = ip->protocol;
+
+    if (!bpf_map_lookup_elem(&l7_seen_map, &l7_key)) {
+        __u8 mark = 1;
+        bpf_map_update_elem(&l7_seen_map, &l7_key, &mark, BPF_ANY);
+
+        int is_http_request =
+            (http_buf[0]=='G' && http_buf[1]=='E' && http_buf[2]=='T' && http_buf[3]==' ') ||
+            (http_buf[0]=='P' && http_buf[1]=='O' && http_buf[2]=='S' && http_buf[3]=='T' && http_buf[4]==' ') ||
+            (http_buf[0]=='H' && http_buf[1]=='E' && http_buf[2]=='A' && http_buf[3]=='D' && http_buf[4]==' ') ||
+            (http_buf[0]=='P' && http_buf[1]=='U' && http_buf[2]=='T' && http_buf[3]==' ') ||
+            (http_buf[0]=='D' && http_buf[1]=='E' && http_buf[2]=='L' && http_buf[3]=='E' && http_buf[4]=='T' && http_buf[5]=='E' && http_buf[6]==' ') ||
+            (http_buf[0]=='O' && http_buf[1]=='P' && http_buf[2]=='T' && http_buf[3]=='I' && http_buf[4]=='O' && http_buf[5]=='N' && http_buf[6]=='S' && http_buf[7]==' ') ||
+            (http_buf[0]=='C' && http_buf[1]=='O' && http_buf[2]=='N' && http_buf[3]=='N' && http_buf[4]=='E' && http_buf[5]=='C' && http_buf[6]=='T' && http_buf[7]==' ') ||
+            (http_buf[0]=='P' && http_buf[1]=='A' && http_buf[2]=='T' && http_buf[3]=='C' && http_buf[4]=='H' && http_buf[5]==' ') ||
+            (http_buf[0]=='T' && http_buf[1]=='R' && http_buf[2]=='A' && http_buf[3]=='C' && http_buf[4]=='E' && http_buf[5]==' ');
+
+        if (!is_http_request) {
+            __u32 src_ip = ip->saddr;
+            struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
+            if (bpf_map_update_elem(&dynamic_bans_map, &src_ip, &block_data, BPF_ANY) == 0) {
+                bpf_map_delete_elem(&ip_tracker, &src_ip);
+                struct ips_ban_event *event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
+                if (event) {
+                    event->src_ip     = src_ip;
+                    event->drop_count = 0;
+                    event->reason     = IPS_BAN_REASON_PROTOCOL_MISMATCH;
+                    bpf_ringbuf_submit(event, 0);
+                }
+            }
+            return XDP_DROP;
+        }
+    }
+
     struct sni_key key = {0};
     int key_len = 0;
 
@@ -901,6 +1123,77 @@ int http_parser(struct xdp_md *ctx) {
             }
             return XDP_DROP;
         }
+    }
+
+    return XDP_PASS;
+}
+
+SEC("xdp")
+// #REQ-XXX: Port/protocol conformance -- SSH (port 22) parser.
+//
+// Real SSH always sends "SSH-" as the literal first 4 bytes of the connection (RFC 4253
+// SS4.2's version-exchange banner, e.g. "SSH-2.0-OpenSSH_9.6"), before any key exchange or
+// encryption -- unlike everything after it, which switches to the encrypted Binary Packet
+// Protocol and looks like opaque bytes on the wire. So, like http_parser, this only strictly
+// enforces the banner shape once per flow (via l7_seen_map) and gets out of the way after.
+//
+// Exit semantics:
+//   XDP_PASS  -- no payload yet, or flow already validated
+//   XDP_DROP  -- first payload packet doesn't start with "SSH-" -> non-SSH protocol
+//                tunneled over port 22 -> ban + event
+int ssh_parser(struct xdp_md *ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data     = (void *)(long)ctx->data;
+    __u32 pkt_len  = (__u32)(data_end - data);
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) return XDP_PASS;
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) return XDP_PASS;
+
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end) return XDP_PASS;
+    __u32 ip_hdr_len = ip->ihl * 4;
+    if (ip_hdr_len < sizeof(struct iphdr)) return XDP_PASS;
+    if (ip->protocol != IPPROTO_TCP) return XDP_PASS;
+
+    struct tcphdr *tcp = (void *)((__u8 *)ip + ip_hdr_len);
+    if ((void *)(tcp + 1) > data_end) return XDP_PASS;
+    __u32 tcp_hdr_len = tcp->doff * 4;
+    if (tcp_hdr_len < sizeof(struct tcphdr)) return XDP_PASS;
+
+    __u32 payload_off = ((__u8 *)tcp - (__u8 *)data) + tcp_hdr_len;
+    if (payload_off > pkt_len) return XDP_PASS;  // guards the subtraction below
+    if (pkt_len - payload_off < 4) return XDP_PASS; // no payload yet (bare ACK, etc.)
+
+    struct flow_key l7_key = {0};
+    l7_key.source_ip   = ip->saddr;
+    l7_key.dest_ip     = ip->daddr;
+    l7_key.source_port = tcp->source;
+    l7_key.dest_port   = tcp->dest;
+    l7_key.protocol    = ip->protocol;
+
+    if (bpf_map_lookup_elem(&l7_seen_map, &l7_key)) return XDP_PASS; // already validated
+
+    __u8 banner[4];
+    if (bpf_xdp_load_bytes(ctx, payload_off, banner, 4) < 0) return XDP_PASS;
+
+    __u8 mark = 1;
+    bpf_map_update_elem(&l7_seen_map, &l7_key, &mark, BPF_ANY);
+
+    if (banner[0] != 'S' || banner[1] != 'S' || banner[2] != 'H' || banner[3] != '-') {
+        __u32 src_ip = ip->saddr;
+        struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
+        if (bpf_map_update_elem(&dynamic_bans_map, &src_ip, &block_data, BPF_ANY) == 0) {
+            bpf_map_delete_elem(&ip_tracker, &src_ip);
+            struct ips_ban_event *event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
+            if (event) {
+                event->src_ip     = src_ip;
+                event->drop_count = 0;
+                event->reason     = IPS_BAN_REASON_PROTOCOL_MISMATCH;
+                bpf_ringbuf_submit(event, 0);
+            }
+        }
+        return XDP_DROP;
     }
 
     return XDP_PASS;

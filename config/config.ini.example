@@ -24,3 +24,9 @@ excluded_source_ips = 127.0.0.0/8
 # just another private LAN (e.g. behind a home router) -- otherwise every legitimate
 # packet from that side looks "internal" and gets silently dropped.
 anti_spoof_enabled = 1
+# Stage 2.6 (out-of-state ACK / ACK-Window/Maimon scan detection): for this many seconds
+# after ips_loader starts, a bare ACK/FIN-ACK with no recorded SYN is let through instead of
+# banned, so connections already established before this restart (an existing SSH session
+# into this box included) survive. Keep this comfortably above how long a restart+reconnect
+# actually takes on this host.
+conn_track_grace_period_seconds = 30
