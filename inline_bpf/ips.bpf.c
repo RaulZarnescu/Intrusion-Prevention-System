@@ -594,13 +594,7 @@ int ips_xdp_main(struct xdp_md *ctx) {
 SEC("xdp")
 // #REQ-058: L7 (TLS/SNI) Parser — redesigned to use bpf_xdp_load_bytes().
 //
-// Why: the previous implementation used a running `int pos` accumulator updated with
-// runtime-variable values (session_id_len, cipher_suites_len, ext_len) then masked
-// with `& 0x3FFF` before each dereference.  The BPF verifier rejects this because
-// after `pos += ext_len` (an unbounded runtime value) the pos range blows up and any
-// subsequent `payload + pos` dereference triggers "offset is outside of the packet".
-//
-// Fix: bpf_xdp_load_bytes(ctx, numeric_offset, local_buf, size) takes a plain __u32
+// bpf_xdp_load_bytes(ctx, numeric_offset, local_buf, size) takes a plain __u32
 // offset and copies bytes into a stack buffer.  The verifier does NOT need to prove
 // the offset is in-bounds — the helper does that at runtime, returning < 0 on error.
 // We check the return value and bail.  No variable-offset pointer arithmetic at all.
@@ -619,19 +613,19 @@ int tls_parser(struct xdp_md *ctx) {
 
     // Fixed-size headers: safe pointer arithmetic (compile-time struct sizes)
     struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end) return XDP_PASS;
-    if (eth->h_proto != bpf_htons(ETH_P_IP)) return XDP_PASS;
+    if ((void *)(eth + 1) > data_end) return XDP_PASS; // bounds check
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) return XDP_PASS; // IPv4 check
 
     struct iphdr *ip = (void *)(eth + 1);
-    if ((void *)(ip + 1) > data_end) return XDP_PASS;
+    if ((void *)(ip + 1) > data_end) return XDP_PASS; // bounds check for standard 20-byte IPv4 header
     __u32 ip_hdr_len = ip->ihl * 4;
-    if (ip_hdr_len < sizeof(struct iphdr)) return XDP_PASS;
-    if (ip->protocol != IPPROTO_TCP) return XDP_PASS;
+    if (ip_hdr_len < sizeof(struct iphdr)) return XDP_PASS; // bogus packet data protection (header claims a false size)
+    if (ip->protocol != IPPROTO_TCP) return XDP_PASS; // Protocol filter
 
-    struct tcphdr *tcp = (void *)((__u8 *)ip + ip_hdr_len);
-    if ((void *)(tcp + 1) > data_end) return XDP_PASS;
+    struct tcphdr *tcp = (void *)((__u8 *)ip + ip_hdr_len); // TCP header start
+    if ((void *)(tcp + 1) > data_end) return XDP_PASS; // bounds check for the header
     __u32 tcp_hdr_len = tcp->doff * 4;
-    if (tcp_hdr_len < sizeof(struct tcphdr)) return XDP_PASS;
+    if (tcp_hdr_len < sizeof(struct tcphdr)) return XDP_PASS; // TCP header length check
 
     // payload_off: plain integer offset, NOT a pointer derived from data.
     // bpf_xdp_load_bytes uses this as a numeric index and validates it internally.
@@ -651,9 +645,10 @@ int tls_parser(struct xdp_md *ctx) {
     // that makes it cheap AND correct to enforce continuously: a non-TLS protocol tunneled
     // over 443 (an SSH banner, raw C2 bytes, ...) fails this on every packet it ever sends,
     // not just the first one, so there's no need for a per-flow "already checked" map here.
-    int looks_like_tls = version_major == 3 &&
+
+    int looks_like_tls = version_major == 3 && // Protocol Version
         (content_type == 20 || content_type == 21 || content_type == 22 ||
-         content_type == 23 || content_type == 24);
+         content_type == 23 || content_type == 24); // Record type (22 means Handshake. Important due to ClientHello)
 
     if (!looks_like_tls) {
         __u32 src_ip = ip->saddr;
@@ -720,8 +715,8 @@ int tls_parser(struct xdp_md *ctx) {
     // Keeping the loop body simple (no opaque scalars) prevents verifier state explosion.
     __u32 sni_pos = 0;  // offset of the SNI extension data (0 = not found)
 
-    #pragma unroll
-    for (int i = 0; i < 10; i++) {
+    #pragma unroll // copy the loop contents in the compiled bytecode
+    for (int i = 0; i < 10; i++) { // we do it 10 times to save CPU cycles. If it's not in the first 10 extensions provided, then we stop looking
         __u8 ext_hdr[4];
         if (bpf_xdp_load_bytes(ctx, pos, ext_hdr, 4) < 0) break;
 
@@ -730,14 +725,14 @@ int tls_parser(struct xdp_md *ctx) {
         pos += 4;
 
         if (ext_type == TLS_EXT_SERVER_NAME) {
-            sni_pos = pos;
+            sni_pos = pos; // no parsing due to state explosion
             break;
         }
 
         // Bound ext_len to prevent unbounded pos accumulation across iterations.
         // A legitimate TLS extension body is never > 2048 bytes; anything larger
         // is either malformed or a crafted evasion attempt.
-        if (ext_len > 2048) return XDP_DROP;
+        if (ext_len > 2048) return XDP_DROP; // integer overflow limit
         pos += ext_len;
     }
 
