@@ -35,6 +35,19 @@ struct ips_allowlist_data {
     __u64 last_seen;
 };
 
+// Stage 0.5 quarantine entries need their own TTL, mirroring dynamic_bans_map's
+// ban_timestamp/age_bans() pattern -- otherwise a source that once talked to a
+// destination banned for unrelated reasons (e.g. that destination's own rate-limit
+// ban, which self-expires) stays walled off forever, long after that destination's
+// ban is gone. quarantine_start_ns is boot-monotonic (bpf_ktime_get_ns()), matching
+// every other in-kernel-only timestamp in this codebase (allowlist's last_seen, the
+// rate limiter's last_update) -- quarantine is never persisted to disk or touched by
+// userspace, so it only needs to be self-consistent within one BPF program's
+// lifetime, not tied to wall time.
+struct ips_quarantine_data {
+    __u64 quarantine_start_ns;
+};
+
 // Per-source-IP "5 clean observations -> trust" probation counter (the greylist). Presence
 // alone means "on probation"; authorized=1 is a permanent fast-track that survives even if
 // the flow's allowlist entry later ages out, so a proven-clean IP never has to re-earn trust
@@ -113,6 +126,11 @@ struct ips_config {
     // startup, stage 2.6 doesn't enforce, so those survive; only after it elapses does an
     // ACK/Window/Maimon scan actually get banned.
     unsigned int conn_track_grace_period_sec;
+    // Stage 0.5 quarantine (ips_xdp_main): how long a source stays quarantined after being
+    // caught talking to an already-banned destination, before it's re-evaluated on its own
+    // merits again. Independent of ban_duration_sec on purpose -- quarantine and dynamic bans
+    // guard against different failure modes (see quarantine_map's comment in ips.bpf.c).
+    unsigned int quarantine_duration_sec;
     char wan_interface[16]; // matches IFNAMSIZ; upstream-facing physical interface (e.g. eth0)
     char lan_interface[16]; // matches IFNAMSIZ; internal-facing physical interface (e.g. eth1)
     // Stage 0.1 BCP38 anti-spoof (ips_xdp_main): drops any WAN-arriving packet whose source

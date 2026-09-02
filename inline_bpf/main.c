@@ -116,6 +116,7 @@ static void load_config(const char *filename, struct ips_config *config) {
     config->allowlist_ttl_sec = 900;
     config->state_dump_interval_sec = 5;
     config->conn_track_grace_period_sec = 30;
+    config->quarantine_duration_sec = 300;
     config->wan_interface[0] = '\0';
     config->lan_interface[0] = '\0';
     config->anti_spoof_enabled = 1;
@@ -196,6 +197,10 @@ static void load_config(const char *filename, struct ips_config *config) {
             else if (strcmp(key, "conn_track_grace_period_seconds") == 0) {
                 config->conn_track_grace_period_sec = (unsigned int)parsed_val;
                 fprintf(stdout, "Out-of-state ACK grace period: %u seconds\n", config->conn_track_grace_period_sec);
+            }
+            else if (strcmp(key, "quarantine_duration_seconds") == 0) {
+                config->quarantine_duration_sec = (unsigned int)parsed_val;
+                fprintf(stdout, "Quarantine Duration: %u seconds\n", config->quarantine_duration_sec);
             }
         }
     }
@@ -464,6 +469,7 @@ static int load_skeleton(struct ips_bpf *skel, struct ips_config *config){
         __u64 now_ns = (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
         skel->rodata->grace_period_end_ns = now_ns + (__u64)config->conn_track_grace_period_sec * 1000000000ULL;
     }
+    skel->rodata->quarantine_duration_ns = (__u64)config->quarantine_duration_sec * 1000000000ULL;
     if (ips_bpf__load(skel)) {
         fprintf(stderr, "[!] FATAL: Failed to load BPF skeleton.\n");
         ips_bpf__destroy(skel);

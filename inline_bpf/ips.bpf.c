@@ -133,7 +133,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u32);
-    __type(value, __u8);
+    __type(value, struct ips_quarantine_data);
     __uint(max_entries, 10240);
 } quarantine_map SEC(".maps");
 
@@ -154,6 +154,10 @@ volatile const __u32 wan_ifindex = 0;
 // connections already established when ips_loader restarts (this box's own SSH session
 // included) survive instead of getting banned for having no recorded SYN in the fresh map.
 volatile const __u64 grace_period_end_ns = 0;
+// Duration (not a deadline -- unlike grace_period_end_ns, this is measured from each
+// quarantine entry's own quarantine_start_ns, since entries are created continuously,
+// not just at attach time). Computed once in main.c from quarantine_duration_sec.
+volatile const __u64 quarantine_duration_ns = 0;
 
 //----------------------------------------------------------------------------------------------------------------------
 
@@ -261,15 +265,23 @@ int ips_xdp_main(struct xdp_md *ctx) {
     // excluded_source_ips (config.ini) to cover this.
     struct lpm_ip_key q_excl_key = { .prefixlen = 32, .ip = src_ip };
     if (!bpf_map_lookup_elem(&excluded_srcs, &q_excl_key)) {
-        __u8 *quarantined = bpf_map_lookup_elem(&quarantine_map, &src_ip);
+        struct ips_quarantine_data *quarantined = bpf_map_lookup_elem(&quarantine_map, &src_ip);
         if (quarantined) {
-            return XDP_DROP; // Host is isolated!
+            __u64 elapsed = bpf_ktime_get_ns() - quarantined->quarantine_start_ns;
+            if (elapsed < quarantine_duration_ns) {
+                return XDP_DROP; // Still isolated.
+            }
+            // TTL expired -- release. Falls through to the dest_blocked check below, which
+            // re-quarantines with a fresh timestamp if this source is still, right now,
+            // talking to a destination that's still banned (otherwise this source gets a
+            // clean re-evaluation, same as anyone else).
+            bpf_map_delete_elem(&quarantine_map, &src_ip);
         }
 
         struct ips_blocklist_data *dest_blocked = bpf_map_lookup_elem(&dynamic_bans_map, &dest_ip);
         if (dest_blocked) {
-            __u8 val = 1;
-            bpf_map_update_elem(&quarantine_map, &src_ip, &val, BPF_ANY);
+            struct ips_quarantine_data q_val = { .quarantine_start_ns = bpf_ktime_get_ns() };
+            bpf_map_update_elem(&quarantine_map, &src_ip, &q_val, BPF_ANY);
             return XDP_DROP;
         }
     }

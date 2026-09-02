@@ -30,3 +30,13 @@ anti_spoof_enabled = 1
 # into this box included) survive. Keep this comfortably above how long a restart+reconnect
 # actually takes on this host.
 conn_track_grace_period_seconds = 30
+# Stage 0.5 (quarantine): how long a source stays quarantined after being observed
+# talking to an already-banned destination, before it's re-evaluated on its own
+# merits again. Independent of ban_duration_seconds -- this guards against a
+# different failure mode: an innocent source that sent one packet to a peer banned
+# for unrelated reasons (e.g. that peer's own rate-limit ban, which self-expires)
+# would otherwise stay walled off forever, since quarantine previously had no TTL
+# at all. Lower this if legitimate cross-talk with a transiently-banned host should
+# recover faster; raise it if quarantined sources tend to still be a problem well
+# past this window.
+quarantine_duration_seconds = 300
