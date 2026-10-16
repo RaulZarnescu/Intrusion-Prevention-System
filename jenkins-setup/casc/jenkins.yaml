@@ -1,0 +1,45 @@
+jenkins:
+  systemMessage: "IPS CI — provisioned automatically via Jenkins Configuration as Code (JCasC). Do not edit security settings or the pipeline job by hand; edit jenkins-setup/casc/jenkins.yaml instead, then recreate the container."
+  numExecutors: 2
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "${JENKINS_ADMIN_ID}"
+          password: "${JENKINS_ADMIN_PASSWORD}"
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - usernamePassword:
+              scope: GLOBAL
+              id: "github-token"
+              username: "x-access-token"
+              password: "${GITHUB_TOKEN}"
+              description: "GitHub PAT used for repo checkout and webhook/API access"
+
+jobs:
+  - script: |
+      pipelineJob('ips-pipeline') {
+        definition {
+          cpsScm {
+            scm {
+              git {
+                remote {
+                  url('https://github.com/RaulZarnescu/Intrusion-Prevention-System.git')
+                  credentials('github-token')
+                }
+                branches('*/main')
+              }
+            }
+            scriptPath('Jenkinsfile')
+          }
+        }
+        triggers {
+          githubPush()
+        }
+      }

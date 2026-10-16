@@ -20,7 +20,7 @@ pipeline {
 	stage('Daemon Test') {
 	    steps {
 		sh '''
-		    python3 Jenkinstests/test_daemon.py -v
+		    python3 Jenkinstests/Daemon/test_daemon.py -v
 		'''
 	    }
 	}

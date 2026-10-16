@@ -1,16 +1,9 @@
 #!/bin/bash
 set -e
 
-# Initialize Jenkins home if it's empty
-if [ ! -d "/var/jenkins_home/jobs/ips-pipeline" ]; then
-    echo "Initializing Jenkins home from state backup..."
-    if [ -f "/var/jenkins_home_init/jenkins_state.tar.gz" ]; then
-        tar -xzf /var/jenkins_home_init/jenkins_state.tar.gz -C /var/jenkins_home
-        echo "State unpacked successfully."
-    else
-        echo "No jenkins_state.tar.gz found in /var/jenkins_home_init, proceeding with empty Jenkins."
-    fi
-fi
+# No state to restore: security settings, credentials, and the pipeline job are
+# all provisioned by Jenkins Configuration as Code on every boot (see
+# casc/jenkins.yaml and CASC_JENKINS_CONFIG in the Dockerfile).
 
 # Ensure ownership is correct
 chown -R jenkins:jenkins /var/jenkins_home

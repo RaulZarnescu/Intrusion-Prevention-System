@@ -11,6 +11,7 @@ checks-api
 cloudbees-folder
 commons-lang3-api
 commons-text-api
+configuration-as-code
 credentials-binding
 credentials
 dark-theme
@@ -38,6 +39,7 @@ jakarta-xml-bind-api
 javax-activation-api
 jaxb
 jjwt-api
+job-dsl
 joda-time-api
 jquery3-api
 json-api

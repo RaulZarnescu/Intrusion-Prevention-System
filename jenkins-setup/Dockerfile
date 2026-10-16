@@ -25,6 +25,13 @@ RUN echo "jenkins ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
 RUN jenkins-plugin-cli --plugin-file /usr/share/jenkins/ref/plugins.txt
 
+# Configuration as Code: this is the whole instance (security, credentials, the
+# pipeline job) defined declaratively. Jenkins applies it automatically on every
+# boot because CASC_JENKINS_CONFIG is set, so there is no state to carry between
+# machines beyond this file and the secrets in .env.
+COPY casc/jenkins.yaml /usr/share/jenkins/ref/casc_configs/jenkins.yaml
+ENV CASC_JENKINS_CONFIG=/usr/share/jenkins/ref/casc_configs
+
 # Copy our custom entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

@@ -8,14 +8,16 @@ services:
     container_name: ips_jenkins
     privileged: false # Jenkins doesn't need privileges, just docker socket
     ports:
-      - "8080:8080"
+      - "8081:8080"
       - "50000:50000"
     volumes:
       - jenkins_home:/var/jenkins_home
-      # Mount the tarball into the container so entrypoint.sh can unpack it on first boot
-      - ./jenkins_state.tar.gz:/var/jenkins_home_init/jenkins_state.tar.gz:ro
       # Allow docker-in-docker stages (like Flood Test)
       - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - JENKINS_ADMIN_ID=${JENKINS_ADMIN_ID}
+      - JENKINS_ADMIN_PASSWORD=${JENKINS_ADMIN_PASSWORD}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
     restart: unless-stopped
     networks:
       - jenkins_net

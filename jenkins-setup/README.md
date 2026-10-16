@@ -1,24 +1,52 @@
 # Jenkins CI/CD Setup
 
-This folder contains the Infrastructure-as-Code to run the Jenkins environment for the Intrusion Prevention System. 
-It automates the installation of the C/eBPF build toolchain, handles Docker-in-Docker socket permissions, and sets up Ngrok for GitHub Webhooks.
+Infrastructure-as-Code for the Jenkins instance that builds and tests the Intrusion
+Prevention System. The whole instance — security realm, credentials, and the pipeline
+job — is defined declaratively via Jenkins Configuration as Code (JCasC) and Job DSL
+(`casc/jenkins.yaml`). Nothing is carried between machines as opaque state; the only
+thing that moves is this repo plus a handful of secrets.
 
-## How to move this to a new machine
+## Moving this to a new machine
 
-1. Copy your `jenkins_state.tar.gz` from the original machine into this directory (`jenkins-setup/`). 
-   *(Note: This file is gitignored because it contains secrets like your Jenkins admin hash. You must move it manually via USB/SCP, etc. or remove it from `.gitignore` at your own risk if you want to push it to a private repo).*
-2. Copy `.env.example` to `.env` and fill in your Ngrok auth token:
-   ```bash
-   cp .env.example .env
-   ```
-3. Run the setup:
-   ```bash
-   docker compose up -d --build
-   ```
+Run the bootstrap script from inside this folder:
+
+```bash
+cd jenkins-setup
+./setup.sh
+```
+
+It will:
+1. Install Docker (via the official convenience script) if it isn't already present.
+2. Add you to the `docker` group if needed (you'll be asked to re-login and re-run).
+3. Create `jenkins-setup/.env` and prompt you once for the four secrets it needs
+   (Jenkins admin username/password, a GitHub token, and an ngrok auth token) — skipped
+   automatically if `.env` already exists.
+4. `docker compose up -d --build`.
+5. Wait for Jenkins to come up and print the URL.
+
+That's the whole setup. Re-running `./setup.sh` on a machine that's already configured
+just re-syncs the containers — it won't re-prompt or reinstall anything.
+
+Note: step 3 creates `.env` in this folder (`jenkins-setup/.env`), right next to
+`.env.example` — same place `docker compose` expects to find it.
 
 ## What happens under the hood?
 
-- The `Dockerfile` builds a custom image based on `jenkins/jenkins:lts`. It installs all required apt packages (`clang`, `cmake`, `bpftool`, `docker.io`, etc.) and pre-installs all Jenkins plugins via `plugins.txt`.
-- On boot, the `entrypoint.sh` script detects the `docker.sock` GID on the host machine and automatically adds the Jenkins user to that group so the `Flood Test` stage can spawn sibling Docker containers without permission errors.
-- It also unpacks `jenkins_state.tar.gz` into the container on its very first run, instantly restoring all your jobs, users, and build history.
-- A sidecar `ngrok` container spins up, connects to Jenkins, and forwards it to your static domain `clear-stowing-rebirth.ngrok-free.dev`.
+- `Dockerfile` builds on `jenkins/jenkins:lts`, installing the C/eBPF toolchain
+  (`clang`, `cmake`, `bpftool`, etc.) and all plugins from `plugins.txt`.
+- `casc/jenkins.yaml` is baked into the image and applied automatically on every boot
+  (via `CASC_JENKINS_CONFIG`): it creates the admin user from `JENKINS_ADMIN_ID` /
+  `JENKINS_ADMIN_PASSWORD`, a GitHub credential from `GITHUB_TOKEN`, and the
+  `ips-pipeline` job (via Job DSL) pointed at this repo's `Jenkinsfile` with a GitHub
+  push trigger. There is no manual "New Item" step, ever.
+- `entrypoint.sh` maps the host's `docker.sock` GID into the container so the Flood
+  Test stage can spawn sibling containers, then starts Jenkins.
+- A sidecar `ngrok` container forwards the static domain `clear-stowing-rebirth.ngrok-free.dev`
+  to Jenkins, for the GitHub webhook.
+
+## Secrets
+
+`jenkins-setup/.env` is gitignored — it holds real credentials and is never committed.
+`.env.example` documents the required keys. If you lose `.env`, there's nothing to
+recover: just re-run `./setup.sh`, re-enter the secrets, and JCasC rebuilds the exact
+same instance from scratch.
