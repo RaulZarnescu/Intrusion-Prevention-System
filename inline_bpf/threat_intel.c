@@ -7,6 +7,7 @@
 #include "ips_fast_common.h"
 #include "threat_intel.h"
 
+// #REQ-057: Implementare listă de reputație IP în eBPF Blocklist
 int inject_threat_intel(const char *filepath, int static_blocklist_fd) {
     FILE *file = fopen(filepath, "r");
     if (!file) {

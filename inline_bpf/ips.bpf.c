@@ -80,7 +80,7 @@ struct {
     __uint(max_entries, 131072);
 } allowlist SEC(".maps");
 
-// #REQ-XXX: Greylist bootstrap ("5 clean observations -> trust"), per source IP.
+// #REQ-077: Greylist bootstrap ("5 clean observations -> trust"), per source IP.
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, __u32);
@@ -88,7 +88,7 @@ struct {
     __uint(max_entries, 65536);
 } greylist SEC(".maps");
 
-// #REQ-XXX: Port/protocol conformance ("first packet" tracking for http_parser/ssh_parser).
+// #REQ-079: Port/protocol conformance ("first packet" tracking for http_parser/ssh_parser).
 // Presence means this flow's very first payload-bearing packet already ran the strict
 // request-line/banner check -- HTTP/SSH only guarantee their identifying shape on that one
 // packet (everything after is a body chunk, a second keep-alive request, or opaque encrypted
@@ -103,7 +103,7 @@ struct {
     __uint(max_entries, 65536);
 } l7_seen_map SEC(".maps");
 
-// #REQ-XXX: Stage 2.6 out-of-state ACK detection (ACK/Window/Maimon scan). Presence means
+// #REQ-076: Stage 2.6 out-of-state ACK detection (ACK/Window/Maimon scan). Presence means
 // a genuine SYN (SYN=1,ACK=0) was observed for this flow -- written for BOTH directions
 // (forward and reverse, same reasoning as `allowlist`'s promotion above) so the server's own
 // return traffic isn't mistaken for an out-of-state probe too. Keyed on struct flow_key with
@@ -115,6 +115,7 @@ struct {
     __uint(max_entries, 131072);
 } conn_seen_map SEC(".maps");
 
+// #REQ-081: Infrastructure / Core Network Exemption
 // Source IPs/subnets exempt from the greylist bootstrap, loaded once from config.ini's
 // excluded_source_ips at startup (main.c owns writes, same as threat_intel_map/injector.c).
 struct {
@@ -196,7 +197,7 @@ int ips_xdp_main(struct xdp_md *ctx) {
     __u8 *action_flag;
 
     // ====================================================
-    // STAGE 0.05: IP FRAGMENTATION - #REQ-XXX
+    // STAGE 0.05: IP FRAGMENTATION - #REQ-078
     // ====================================================
     // Every check downstream of this point (malformed-flags, port/protocol conformance,
     // recon tracker, L7 parsers...) assumes the full L4 header is present in this one
@@ -255,7 +256,7 @@ int ips_xdp_main(struct xdp_md *ctx) {
     }
 
     // ====================================================
-    // STAGE 0.5: QUARANTINE & COMPROMISE DETECTION
+    // STAGE 0.5: QUARANTINE & COMPROMISE DETECTION - #REQ-080
     // ====================================================
     // Core network infrastructure (gateway, AP) is exempt: quarantine_map has no expiry
     // (unlike dynamic_bans_map), so a single innocent packet from one of these devices toward
@@ -393,7 +394,7 @@ int ips_xdp_main(struct xdp_md *ctx) {
         current_flow.tcp_flags = tcp_bytes[13];
 
         // ====================================================
-        // STAGE 2.5: MALFORMED TCP FLAGS - #REQ-069
+        // STAGE 2.5: MALFORMED TCP FLAGS - #REQ-076
         // ====================================================
         if (is_malicious_tcp_flags(tcp)) {
             struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
@@ -413,7 +414,7 @@ int ips_xdp_main(struct xdp_md *ctx) {
         }
 
         // ====================================================
-        // STAGE 2.6: OUT-OF-STATE ACK - #REQ-XXX (ACK/Window/Maimon scan detection)
+        // STAGE 2.6: OUT-OF-STATE ACK - #REQ-076 (ACK/Window/Maimon scan detection)
         // ====================================================
         // ACK/Window scans (-sA/-sW) and Maimon scans (-sM) send a bare ACK or FIN+ACK that
         // never followed a real SYN -- flags alone can't tell that apart from a legitimate
@@ -651,7 +652,7 @@ int tls_parser(struct xdp_md *ctx) {
     __u8 content_type  = tls_hdr[0];
     __u8 version_major = tls_hdr[1];
 
-    // #REQ-XXX: Port/protocol conformance. Every TLS record -- handshake, application_data,
+    // #REQ-079: Port/protocol conformance. Every TLS record -- handshake, application_data,
     // alert, change_cipher_spec, heartbeat -- carries this same 5-byte header shape on every
     // single packet of the connection, not just the handshake. Unlike HTTP (see http_parser),
     // that makes it cheap AND correct to enforce continuously: a non-TLS protocol tunneled
@@ -995,7 +996,7 @@ int http_parser(struct xdp_md *ctx) {
     __u32 load_len = (avail < sizeof(http_buf)) ? avail : sizeof(http_buf);
     if (bpf_xdp_load_bytes(ctx, payload_off, http_buf, load_len) < 0) return XDP_PASS;
 
-    // #REQ-XXX: Port/protocol conformance -- only on this flow's first payload-bearing
+    // #REQ-079: Port/protocol conformance -- only on this flow's first payload-bearing
     // packet, since that's the only place a genuine HTTP request line is guaranteed to
     // appear. A non-HTTP protocol tunneled over port 80 (SSH, raw C2, ...) fails this on
     // its very first byte. A large POST body or a keep-alive connection's later packets
@@ -1136,7 +1137,7 @@ int http_parser(struct xdp_md *ctx) {
 }
 
 SEC("xdp")
-// #REQ-XXX: Port/protocol conformance -- SSH (port 22) parser.
+// #REQ-079: Port/protocol conformance -- SSH (port 22) parser.
 //
 // Real SSH always sends "SSH-" as the literal first 4 bytes of the connection (RFC 4253
 // SS4.2's version-exchange banner, e.g. "SSH-2.0-OpenSSH_9.6"), before any key exchange or

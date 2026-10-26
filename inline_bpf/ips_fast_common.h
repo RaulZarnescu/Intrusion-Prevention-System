@@ -58,7 +58,7 @@ struct ips_greylist_data {
 };
 
 // ==============================================================================
-// #REQ-XXX: Ring Buffer Event
+// #REQ-074: Ring Buffer Event
 // ==============================================================================
 
 // What triggered the ban. Rate limiting is the only producer today, but the
@@ -93,7 +93,7 @@ struct ips_recon_event {
 };
 
 // ==============================================================================
-// #REQ-XXX: Longest Prefix Match map
+// #REQ-071: Longest Prefix Match map
 // used for the blacklist to prevent overflow by attaching the whole subnet to an ip with a prefix
 //
 // !!!!!!!!!!! POSSIBLE BOTTLENECK !!!!!!!!!!!!!!!!!!
@@ -108,7 +108,7 @@ struct lpm_ip_key {
 #define MAX_EXCLUDED_SRCS 16 // cap on excluded_source_ips entries parsed from config.ini
 
 // ==============================================================================
-// #REQ-XXX: .ini config file
+// .ini config file structure
 // ==============================================================================
 
 struct ips_config {

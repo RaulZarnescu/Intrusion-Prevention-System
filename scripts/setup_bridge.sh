@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# #REQ-001: Configurare Raspberry Pi ca Transparent Layer 2 Bridge (br0) între eth0 și eth1
 # Creates the OS-level Linux bridge (br0) spanning wan_interface/lan_interface from
 # config.ini. ips_loader only ATTACHES XDP to whichever physical interfaces are already
 # bridged -- it has never created the bridge itself (see the TODO above
