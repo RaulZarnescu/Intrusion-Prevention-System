@@ -439,6 +439,48 @@ static int handle_ban_event(void *ctx, void *data, size_t data_sz) {
     return 0;
 }
 
+// conn_seen_map (Stage 2.6's SYN-seen state) must SURVIVE a restart, unlike threat_intel_map
+// below, which is deliberately rebuilt from threats.txt every boot -- there's no file on disk
+// to rebuild conn_seen_map's state from, so a restart that empties it makes every still-live
+// connection look "out-of-state" again until it naturally re-handshakes (this is what banned
+// the gateway on 2026-09-02: its long-lived connection went quiet past the startup grace
+// period, then resumed, and conn_seen_map had no record of its original SYN).
+//
+// Setting the pin path BEFORE load (via bpf_map__set_pin_path(), unlike pin_bpf_map() below
+// which pins AFTER load) makes libbpf's own map-creation step reuse the map already pinned at
+// this path -- and its entries -- instead of creating a fresh empty one. If a previously
+// pinned map is incompatible with the current map definition (e.g. max_entries changed across
+// a code upgrade), reusing it would make ips_bpf__load() fail outright, so an incompatible pin
+// is detected and removed first, falling back to a fresh map just for that one restart.
+static int reuse_pinned_map_or_reset(struct bpf_map *map, const char *pin_path) {
+    int fd = bpf_obj_get(pin_path);
+    if (fd >= 0) {
+        struct bpf_map_info info = {0};
+        __u32 info_len = sizeof(info);
+        bool compatible = bpf_map_get_info_by_fd(fd, &info, &info_len) == 0 &&
+                           info.type == bpf_map__type(map) &&
+                           info.key_size == bpf_map__key_size(map) &&
+                           info.value_size == bpf_map__value_size(map) &&
+                           info.max_entries == bpf_map__max_entries(map);
+        close(fd);
+
+        if (!compatible) {
+            fprintf(stderr, "[!] Pinned map at %s doesn't match the current map definition -- "
+                             "resetting it (state from before this upgrade is lost).\n", pin_path);
+            unlink(pin_path);
+        }
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "[!] Failed to check existing pinned map at %s: %s\n", pin_path, strerror(errno));
+    }
+
+    int err = bpf_map__set_pin_path(map, pin_path);
+    if (err) {
+        fprintf(stderr, "[!] FATAL: Failed to set pin path for map at %s: %d.\n", pin_path, err);
+        return 1;
+    }
+    return 0;
+}
+
 static int load_skeleton(struct ips_bpf *skel, struct ips_config *config){
     load_config(CONFIG_FILE_PATH, config);
 
@@ -470,6 +512,12 @@ static int load_skeleton(struct ips_bpf *skel, struct ips_config *config){
         skel->rodata->grace_period_end_ns = now_ns + (__u64)config->conn_track_grace_period_sec * 1000000000ULL;
     }
     skel->rodata->quarantine_duration_ns = (__u64)config->quarantine_duration_sec * 1000000000ULL;
+
+    if (reuse_pinned_map_or_reset(skel->maps.conn_seen_map, CONN_SEEN_MAP_PIN_PATH)) {
+        ips_bpf__destroy(skel);
+        return 1;
+    }
+
     if (ips_bpf__load(skel)) {
         fprintf(stderr, "[!] FATAL: Failed to load BPF skeleton.\n");
         ips_bpf__destroy(skel);

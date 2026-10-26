@@ -26,6 +26,12 @@
 // `ips_injector` run reaches the same map main.c self-injects into at boot.
 #define STATIC_BLOCKLIST_PIN_PATH "/sys/fs/bpf/ips_static_blocklist"
 
+// Pinned so conn_seen_map's SYN-seen state survives a `systemctl restart ips-*` instead
+// of starting empty -- see reuse_pinned_map_or_reset() in main.c. Unlike
+// STATIC_BLOCKLIST_PIN_PATH above, this one is pinned BEFORE load so libbpf reuses the
+// existing map (and its entries) rather than replacing it.
+#define CONN_SEEN_MAP_PIN_PATH "/sys/fs/bpf/ips_conn_seen_map"
+
 #define BATCH_SIZE 1024 // can be 2048 as raspberry pi has 64kb l1 cache for data
 
 
