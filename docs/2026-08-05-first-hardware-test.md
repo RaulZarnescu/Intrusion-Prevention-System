@@ -37,6 +37,12 @@ XDP mode** — the fast path for packet filtering, meaning the filter runs at th
 possible point in the network driver, before the normal Linux networking stack even
 sees the packet.
 
+> **Correction (2026-11-04):** this was wrong. The loader printed "native mode" but the
+> kernel had attached in generic/SKB mode (neither `macb` nor `r8152` has native XDP).
+> The packet-visibility conclusion below still holds (generic XDP runs before the
+> `tcpdump` tap), but the "before the stack / before `sk_buff` allocation" framing does not.
+> See `2026-11-04-xdp-mode-findings-and-embedded-target-requirements.md`.
+
 ---
 
 ## Part 2 — The big mystery: why can't anything get an IP address?

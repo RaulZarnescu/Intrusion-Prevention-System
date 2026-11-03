@@ -565,7 +565,21 @@ static struct xdp_attach_result attach_xdp(struct bpf_program *prog, unsigned in
 
     result.link = bpf_program__attach_xdp(prog, ifindex);
     if (result.link) {
-        printf("[+] XDP attached to %s (Index: %u, native mode)\n", iface_name, ifindex);
+        // bpf_program__attach_xdp() passes no mode flags, so for a driver without native
+        // XDP support the kernel quietly attaches in generic/SKB mode instead of failing --
+        // this branch is taken either way. Ask the kernel which mode it actually picked
+        // so the log (and anything quoting it) doesn't claim native mode on e.g. macb/r8152.
+        const char *mode = "unknown mode";
+        LIBBPF_OPTS(bpf_xdp_query_opts, qopts);
+        if (bpf_xdp_query((int)ifindex, 0, &qopts) == 0) {
+            switch (qopts.attach_mode) {
+                case XDP_ATTACHED_DRV: mode = "native mode"; break;
+                case XDP_ATTACHED_SKB: mode = "generic/SKB mode (driver has no native XDP)"; break;
+                case XDP_ATTACHED_HW:  mode = "hardware offload mode"; break;
+                default: break;
+            }
+        }
+        printf("[+] XDP attached to %s (Index: %u, %s)\n", iface_name, ifindex, mode);
         result.ok = true;
         return result;
     }
