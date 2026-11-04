@@ -109,8 +109,11 @@ static void parse_excluded_srcs(const char *value, struct ips_config *config) {
 
 static void load_config(const char *filename, struct ips_config *config) {
     config->ban_duration_sec = 3600;
-    config->token_bucket_max = 50;
-    config->token_refill_rate = 10;
+    // Per-source packet rate limiter (Stage 2). Must be sized to the link: the old 50 / 10-20 pps
+    // defaults treated any bulk transfer as a flood (a 36 Mbit/s download was banned repeatedly and
+    // got 0 Mbit/s, 2026-11-04). 10,000 pps is ~120 Mbit/s of full-size frames, i.e. a 100 Mb/s link.
+    config->token_bucket_max = 2000;
+    config->token_refill_rate = 10000;
     config->max_tolerated_drops = 15;
     config->threat_intel_refresh_sec = 86400;
     config->allowlist_ttl_sec = 900;
@@ -173,6 +176,11 @@ static void load_config(const char *filename, struct ips_config *config) {
             else if (strcmp(key, "token_refill_rate") == 0) {
                 config->token_refill_rate = (unsigned int)parsed_val;
                 fprintf(stdout, "Token Refill Rate: %u tokens/sec\n", config->token_refill_rate);
+                if (config->token_refill_rate < 1000) {
+                    fprintf(stderr, "[!] WARNING: token_refill_rate (%u/s) is below ~12 Mbit/s of full-size packets per source -- "
+                                    "a normal bulk transfer will be classed as a flood and its source banned.\n",
+                            config->token_refill_rate);
+                }
             }
             else if (strcmp(key, "max_tolerated_drops") == 0) {
                 config->max_tolerated_drops = (unsigned int)parsed_val;

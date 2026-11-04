@@ -531,6 +531,7 @@ int ips_xdp_main(struct xdp_md *ctx) {
         struct ips_recon_event *revent = bpf_ringbuf_reserve(&recon_events, sizeof(*revent), 0);
         if (revent) {
             revent->src_ip = ip->saddr;
+            revent->dst_ip = ip->daddr;
             revent->dst_port = bpf_ntohs(current_flow.dest_port);
             revent->protocol = PROTO_TCP;
             bpf_ringbuf_submit(revent, 0);
@@ -575,6 +576,7 @@ int ips_xdp_main(struct xdp_md *ctx) {
                 struct ips_recon_event *revent = bpf_ringbuf_reserve(&recon_events, sizeof(*revent), 0);
                 if (revent) {
                     revent->src_ip = ip->saddr;
+                    revent->dst_ip = ip->daddr;
                     revent->dst_port = 0;
                     revent->protocol = PROTO_ICMP;
                     bpf_ringbuf_submit(revent, 0);

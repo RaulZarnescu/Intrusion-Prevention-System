@@ -22,6 +22,8 @@ struct recon_state {
     time_t last_update;
     uint16_t recent_ports[16];
     int port_idx;
+    uint32_t recent_hosts[16]; // ICMP echo destinations seen recently (network byte order)
+    int host_idx;
 };
 
 // Subnet tracking for escalation
@@ -58,6 +60,8 @@ static struct recon_state *get_or_create_tracker(uint32_t src_ip) {
         s->last_update = time(NULL);
         s->port_idx = 0;
         memset(s->recent_ports, 0, sizeof(s->recent_ports));
+        s->host_idx = 0;
+        memset(s->recent_hosts, 0, sizeof(s->recent_hosts));
         return s;
     }
     return NULL;
@@ -114,6 +118,18 @@ int handle_recon_event(void *ctx, void *data, size_t data_sz) {
         
         s->recent_ports[s->port_idx] = event->dst_port;
         s->port_idx = (s->port_idx + 1) % 16;
+    } else {
+        // ICMP echo: a ping SWEEP is many different hosts, so charge one token per new
+        // destination. Repeated pings to a host seen in the last 16 are free here (a ping
+        // FLOOD to one host is the per-source rate limiter's job, Stage 2). Charging every
+        // echo request banned a benign phone pinging ~9 times a minute (2026-11-04 S2 run).
+        int seen = 0;
+        for (int i = 0; i < 16; i++) {
+            if (s->recent_hosts[i] == event->dst_ip) { seen = 1; break; }
+        }
+        if (seen) return 0;
+        s->recent_hosts[s->host_idx] = event->dst_ip;
+        s->host_idx = (s->host_idx + 1) % 16;
     }
     
     int cost = 1;

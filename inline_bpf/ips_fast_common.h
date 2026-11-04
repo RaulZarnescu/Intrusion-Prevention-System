@@ -88,6 +88,7 @@ struct ips_ban_event {
 
 struct ips_recon_event {
     __u32 src_ip;
+    __u32 dst_ip;   // network byte order; lets user space tell a ping sweep (many hosts) from repeated pings to one host
     __u16 dst_port;
     __u8 protocol; // PROTO_TCP or PROTO_ICMP
 };

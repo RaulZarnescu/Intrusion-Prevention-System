@@ -5,8 +5,10 @@
 # excluded_source_ips are specific to that machine's NICs and network.
 
 ban_duration_seconds = 3600
-token_bucket_max = 50
-token_refill_rate = 20
+# Per-source packet rate limiter. Size it to the link: refill ~= packets/s the link can carry
+# (100 Mb/s ~ 8,000-10,000 pps of full-size frames). Tiny values ban normal downloads.
+token_bucket_max = 2000
+token_refill_rate = 10000
 max_tolerated_drops = 15
 threat_intel_refresh_seconds = 86400
 allowlist_ttl_seconds = 900
