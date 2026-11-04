@@ -95,3 +95,15 @@ full-size pps. Test runs used 2000 / 10000. The limiter must be sized to the lin
   priority of Ronaldo to 100.
 - The Pi's USB NIC came back in "USB CD-ROM" mode (0bda:8151) after the panics; only a
   physical replug restored 0bda:8156.
+
+## S2 benign false positives, run 1 (60 min, phone driven over adb, WITH pings)
+Workload: 149 page loads (Chrome, 12 URLs round-robin, one every ~23 s) + `ping -c 3 8.8.8.8` after each.
+Result: the benign phone (192.168.0.176) was banned **3 times** by the recon tracker
+("Tokens depleted ... port/ping sweeping") at 05:12:41, 05:17:58, 05:22:01, and the third ban
+triggered `Subnet Escalation! Banned entire /24: 192.168.0.0` (LAN blocked for the rest of the
+run until the loader was restarted at 06:08). Ban interval ~4.5 min matches the token budget:
+ICMP echo costs 1 token each with no dedup (9 echoes/min vs 40 tokens, +1 token / 300 s regen).
+So an ordinary host pinging ~9 times a minute is classed as a ping sweep; and since escalation
+counts bans (not hosts), three such bans of ONE benign host take down the whole /24.
+Run 2 (no pings, 20 min) separates the page-load contribution; see below.
+Raw: `perf_results.jsonl`, `benign_with_ping.log`.
