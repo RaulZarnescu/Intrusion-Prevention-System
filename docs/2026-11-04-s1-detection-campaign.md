@@ -48,3 +48,23 @@ User reports the power strip chargers are cold. Cause unknown; next step: serial
 or `pstore`, run escalation again with `dmesg -w` over a second path, check PSU.
 Bridge and `ips-loader` come back by themselves after a reboot (`conn_seen_map` pin
 does not survive a reboot, so Stage 2.6 relies on the 30 s grace period).
+
+## RESOLVED (code fix, hardware re-test pending): the Pi reboots were a kernel panic
+Cause: `ips.bpf.c` Stage 1 did `__sync_fetch_and_add(&static_blocked->packets_dropped, 1)` on a
+`threat_intel_map` (BPF_MAP_TYPE_LPM_TRIE) value. `struct lpm_ip_key` is 8 B, so the
+trie stores each value 4 bytes after the node data -> value base is 4 mod 8 -> 64-bit atomic
+is misaligned -> arm64 alignment fault in the RX softirq -> oops -> `panic=10` reboot.
+Reproduced 4x: (1) 3 recon bans -> /24 escalation, (2) 3rd ban again with a monitor
+(last sample healthy: 45 C, 5.13 V, throttled 0x0), (3) manual insert of 192.168.0.0/24 +
+one attacker packet, (4) manual insert of 203.0.113.0/24 + one spoofed packet from
+203.0.113.5. Inserting an entry alone (no matching packet) is harmless. Not thermal
+(44 C idle, critical trip 110 C, no thermal log), not watchdog (`bootstatus` 0x0).
+Impact: ANY packet whose source matches a threat-intel entry (threats.txt, /24 escalation)
+crashes the box. Never seen before because no earlier test sent such a packet.
+Fix: plain `+= 1` instead of the atomic (commit 6f6cd48). The journal on disk lags ~30 s,
+so panic text is never persisted; the 10 s gap before reboot matched `panic=10`.
+Side effect: after the hard resets the Realtek USB NIC (0bda:8156) re-enumerated as
+0bda:8151 "USB CD-ROM" mode and `enx00e04c68003b` disappeared; eject / deauthorize did not
+switch it back, a physical replug was needed.
+Still to verify on hardware: spoofed-source packet from an LPM-matching /24 is dropped,
+`packets_dropped` increments, and no reboot. Then re-run S2/S3/S4.
