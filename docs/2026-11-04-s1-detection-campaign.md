@@ -68,3 +68,30 @@ Side effect: after the hard resets the Realtek USB NIC (0bda:8156) re-enumerated
 switch it back, a physical replug was needed.
 Still to verify on hardware: spoofed-source packet from an LPM-matching /24 is dropped,
 `packets_dropped` increments, and no reboot. Then re-run S2/S3/S4.
+
+## Fix verified on hardware (6f6cd48)
+Spoofed packets from 203.0.113.5 matching an inserted 203.0.113.0/24 entry: 5/5 dropped
+(`packets_dropped: 5`), no reboot. Full 3-bans -> /24 escalation scenario + 5 follow-up packets
+from the banned prefix: no reboot (Pi uptime 701 s -> 833 s).
+
+## S3 performance (phone victim over WiFi, laptop attacker, 100 Mb/s Pi links)
+| | bare bridge | IPS |
+|---|---|---|
+| download, Chrome on phone from laptop http.server (Mbit/s) | 35.8 / 39.3 / 35.5 | 32.3 / 36.3 / 39.5 (limiter 2000/10000) |
+| RTT, 30 echo requests (ms avg) | 6.5 | 6.0 (default limiter), 6.7 (2000/10000) |
+| Pi CPU busy % under hping3 SYN flood (20 s) | 1.1 / 1.1 | 0.4 / 0.6 |
+WiFi-bound; no IPS overhead resolvable. Flood CPU did not stress the Pi (offered pps not measured).
+Raw: `perf_results.jsonl`, `perf_results_defaultlimiter.jsonl`.
+
+## Finding: default rate-limiter parameters break any bulk transfer
+`token_bucket_max = 50`, `token_refill_rate = 20` (per source IP) means ~20 pps sustained.
+With the defaults the same download got **0.0 Mbit/s**: the laptop was banned every ~42 s
+(`BAN: 192.168.0.100 (rate limit exceeded) Drops: 16`). A 100 Mb/s link carries ~8,000
+full-size pps. Test runs used 2000 / 10000. The limiter must be sized to the link.
+
+## Ops notes
+- The laptop auto-joined the home WiFi (DIGI-xCC4) and lost the Pi, which only knows the phone
+  hotspot (SSID Ronaldo, subnet changes per hotspot restart). Set NetworkManager autoconnect
+  priority of Ronaldo to 100.
+- The Pi's USB NIC came back in "USB CD-ROM" mode (0bda:8151) after the panics; only a
+  physical replug restored 0bda:8156.
