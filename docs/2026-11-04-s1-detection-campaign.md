@@ -107,3 +107,17 @@ So an ordinary host pinging ~9 times a minute is classed as a ping sweep; and si
 counts bans (not hosts), three such bans of ONE benign host take down the whole /24.
 Run 2 (no pings, 20 min) separates the page-load contribution; see below.
 Raw: `perf_results.jsonl`, `benign_with_ping.log`.
+
+## S2 run 2 (no pings): 0 bans
+20 min, 60 page loads, no ICMP: **0 bans**. Page loads alone are safe; the false positives of
+run 1 come from ICMP echo cost (1 token each, no dedup) in the recon bucket.
+
+## S4 restart robustness (download in flight, loader restarted at t=15 s)
+| mode | before | after | false bans |
+|---|---|---|---|
+| pinned conn_seen_map (current) | 30.8 Mbit/s | 38.1 | 0 |
+| grace period only (pin removed) | 35.7 | 19.7 | 2 (laptop) |
+| neither (pin removed, grace 0) | 38.9 | 1.9 | 3 (phone, laptop x2) |
+Confirms the pinned map is needed; grace alone only delays the false ban. Raw: `perf_results.jsonl`, `s4.py`.
+(Two earlier S4 attempts were invalid: a stale half-finished file, then a Chrome profile reset left
+Chrome on its welcome screen; discarded.)
