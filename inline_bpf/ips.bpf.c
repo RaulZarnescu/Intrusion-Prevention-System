@@ -306,7 +306,12 @@ int ips_xdp_main(struct xdp_md *ctx) {
 
     struct ips_blocklist_data *static_blocked = bpf_map_lookup_elem(&threat_intel_map, &search_key);
     if (static_blocked) {
-        __sync_fetch_and_add(&static_blocked->packets_dropped, 1);
+        // Plain increment, NOT __sync_fetch_and_add: threat_intel_map is an LPM trie, and the
+        // kernel stores each value right after the key data (4 bytes here, lpm_ip_key is
+        // 8 B), so values sit at 4 mod 8. A 64-bit atomic on such an address faults on arm64
+        // (kernel oops in the RX path -> panic=10 reboot on the Pi 5, hardware-confirmed
+        // 2026-11-04). This is only a statistic, a lost count is harmless.
+        static_blocked->packets_dropped += 1;
         return XDP_DROP;
     }
 
