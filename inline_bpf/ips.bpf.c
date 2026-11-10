@@ -222,29 +222,52 @@ int ips_xdp_main(struct xdp_md *ctx) {
     //      overlapping-fragment attacks (the classic teardrop/rose-fragment evasion class)
     //      to guard against in the reassembly logic itself -- worth it only if exemption
     //      lists prove to be too blunt in practice.
+    //
+    // Narrowed policy (RFC 1858 style) -- only the shapes that evade the L4 checks are banned:
+    //   * a TCP first fragment too short to hold the whole 20-byte TCP header
+    //     (nmap -f / --mtu produce 8- or 16-byte fragments), and a UDP first fragment shorter
+    //     than the 8-byte UDP header;
+    //   * a TCP fragment at offset 1 (bytes 8..15 of the TCP header): it would overwrite the
+    //     flags byte (offset 13) that Stage 2.5 already judged in the first fragment.
+    // Every other fragment (large ping, large UDP/DNS) is legitimate and is let through, but a
+    // NON-FIRST fragment carries no L4 header, so it must never reach the L4 parsing below: its
+    // payload bytes would be read as TCP flags / ports / an ICMP type. Those packets leave the
+    // pipeline right after the ban list and rate limiter (see "non-first fragment" below).
     __u16 frag_info = bpf_ntohs(ip->frag_off);
     __u16 frag_offset = frag_info & 0x1FFF;    // low 13 bits: offset in 8-byte units
     int more_fragments = (frag_info & 0x2000) != 0; // bit 13: MF flag
 
     if (frag_offset != 0 || more_fragments) {
-        struct lpm_ip_key frag_excl_key = { .prefixlen = 32, .ip = src_ip };
-        if (!bpf_map_lookup_elem(&excluded_srcs, &frag_excl_key)) {
-            struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
-            if (bpf_map_update_elem(&dynamic_bans_map, &src_ip, &block_data, BPF_ANY) == 0) {
-                bpf_map_delete_elem(&ip_tracker, &src_ip);
-                struct ips_ban_event *event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
-                if (event) {
-                    event->src_ip     = src_ip;
-                    event->drop_count = 0;
-                    event->reason     = IPS_BAN_REASON_FRAGMENTED;
-                    bpf_ringbuf_submit(event, 0);
-                }
-            }
-            return XDP_DROP;
+        int bad_fragment = 0;
+        __u16 l4_len = 0;
+        __u16 tot_len = bpf_ntohs(ip->tot_len);
+        __u16 hdr_len_b = ip->ihl * 4;
+        if (tot_len >= hdr_len_b) l4_len = tot_len - hdr_len_b;
+
+        if (ip->protocol == IPPROTO_TCP) {
+            if (frag_offset == 0 && l4_len < 20) bad_fragment = 1;   // tiny first fragment
+            if (frag_offset == 1)                bad_fragment = 1;   // overwrites the flags byte
+        } else if (ip->protocol == IPPROTO_UDP) {
+            if (frag_offset == 0 && l4_len < 8)  bad_fragment = 1;   // tiny first fragment
         }
-        // Excluded source: still can't be inspected (no full L4 header here), but skip the
-        // ban -- falls through to the rest of the pipeline like any other packet, which
-        // will itself PASS or DROP incomplete headers per each stage's own bounds checks.
+
+        if (bad_fragment) {
+            struct lpm_ip_key frag_excl_key = { .prefixlen = 32, .ip = src_ip };
+            if (!bpf_map_lookup_elem(&excluded_srcs, &frag_excl_key)) {
+                struct ips_blocklist_data block_data = { .ban_timestamp = 0, .is_static = 0 };
+                if (bpf_map_update_elem(&dynamic_bans_map, &src_ip, &block_data, BPF_ANY) == 0) {
+                    bpf_map_delete_elem(&ip_tracker, &src_ip);
+                    struct ips_ban_event *event = bpf_ringbuf_reserve(&ban_events, sizeof(*event), 0);
+                    if (event) {
+                        event->src_ip     = src_ip;
+                        event->drop_count = 0;
+                        event->reason     = IPS_BAN_REASON_FRAGMENTED;
+                        bpf_ringbuf_submit(event, 0);
+                    }
+                }
+                return XDP_DROP;
+            }
+        }
     }
 
     // ====================================================
@@ -375,6 +398,10 @@ int ips_xdp_main(struct xdp_md *ctx) {
             return XDP_DROP;
         }
     }
+
+    // Non-first fragment: no L4 header here (see Stage 0.05). Bans and the rate limiter above
+    // still applied; nothing below may parse its payload as a header.
+    if ((bpf_ntohs(ip->frag_off) & 0x1FFF) != 0) return XDP_PASS;
 
     // ----------------------------------------------------
     // LAYER 4 PARSING (Needed for Allowlist 5-tuple)
