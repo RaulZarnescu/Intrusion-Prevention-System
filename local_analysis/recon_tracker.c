@@ -14,7 +14,8 @@
 #define STARTING_TOKENS 40
 #define MAX_TOKENS 40
 #define REGEN_SECONDS 300 // +1 token every 5 minutes
-#define BAN_SUBNET_THRESHOLD 3
+#define BAN_SUBNET_THRESHOLD 3      // distinct banned hosts in one /24 that trigger escalation
+#define SUBNET_WINDOW_SECONDS 3600  // bans older than this no longer count towards escalation
 
 struct recon_state {
     uint32_t src_ip;
@@ -27,9 +28,13 @@ struct recon_state {
 };
 
 // Subnet tracking for escalation
+// One entry per /24: a 256-bit bitmap of the host octets banned in the current window. Escalation
+// counts DISTINCT hosts, not bans: one noisy host that is banned again and again is one host.
 struct subnet_state {
-    uint32_t subnet; // network byte order
-    int ban_count;
+    uint32_t subnet;       // network byte order
+    uint64_t hosts[4];     // bit h set = host .h of this /24 was banned in the window
+    time_t window_start;   // time of the first ban counted in this window
+    int escalated;         // /24 already blocked
 };
 
 static struct recon_state trackers[MAX_TRACKED_IPS];
@@ -67,9 +72,16 @@ static struct recon_state *get_or_create_tracker(uint32_t src_ip) {
     return NULL;
 }
 
+static int popcount256(const uint64_t h[4]) {
+    return __builtin_popcountll(h[0]) + __builtin_popcountll(h[1]) +
+           __builtin_popcountll(h[2]) + __builtin_popcountll(h[3]);
+}
+
 static void check_subnet_escalation(int threat_intel_fd, uint32_t src_ip) {
     uint32_t subnet = src_ip & htonl(0xFFFFFF00); // /24 mask
-    
+    unsigned host = ntohl(src_ip) & 0xFF;          // last octet = bit index in the bitmap
+    time_t now = time(NULL);
+
     struct subnet_state *ss = NULL;
     for (int i = 0; i < subnet_count; i++) {
         if (subnets[i].subnet == subnet) {
@@ -77,24 +89,31 @@ static void check_subnet_escalation(int threat_intel_fd, uint32_t src_ip) {
             break;
         }
     }
-    
+
     if (!ss && subnet_count < 1024) {
         ss = &subnets[subnet_count++];
+        memset(ss, 0, sizeof(*ss));
         ss->subnet = subnet;
-        ss->ban_count = 0;
+        ss->window_start = now;
     }
-    
-    if (ss) {
-        ss->ban_count++;
-        if (ss->ban_count >= BAN_SUBNET_THRESHOLD) {
+
+    if (ss && !ss->escalated) {
+        // Old evidence expires: a window with no escalation starts over.
+        if (now - ss->window_start > SUBNET_WINDOW_SECONDS) {
+            memset(ss->hosts, 0, sizeof(ss->hosts));
+            ss->window_start = now;
+        }
+        ss->hosts[host >> 6] |= 1ULL << (host & 63);
+        if (popcount256(ss->hosts) >= BAN_SUBNET_THRESHOLD) {
             // Escalate! Ban the entire /24 subnet permanently via threat_intel_map
             struct lpm_ip_key key = { .prefixlen = 24, .ip = subnet };
-            struct ips_blocklist_data val = { .ban_timestamp = time(NULL), .is_static = 1, .packets_dropped = 0 };
+            struct ips_blocklist_data val = { .ban_timestamp = now, .is_static = 1, .packets_dropped = 0 };
             bpf_map_update_elem(threat_intel_fd, &key, &val, BPF_ANY);
-            
+
             struct in_addr addr = { .s_addr = subnet };
-            printf("[!] RECON TRACKER: Subnet Escalation! Banned entire /24: %s\n", inet_ntoa(addr));
-            ss->ban_count = -10000; // prevent repeated triggers
+            printf("[!] RECON TRACKER: Subnet Escalation! Banned entire /24: %s (%d distinct hosts)\n",
+                   inet_ntoa(addr), popcount256(ss->hosts));
+            ss->escalated = 1;
         }
     }
 }
