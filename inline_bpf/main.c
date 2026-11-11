@@ -428,7 +428,7 @@ static int handle_ban_event(void *ctx, void *data, size_t data_sz) {
            inet_ntoa(ip_addr), ban_reason_to_str(event->reason), event->drop_count);
 
     // Prepare the real-time data
-    struct ips_blocklist_data block_data;
+    struct ips_blocklist_data block_data = {0};   // zero packets_dropped: it was left as stack garbage (F5)
     block_data.ban_timestamp = (uint64_t)time(NULL);
     block_data.is_static = 0;
 
