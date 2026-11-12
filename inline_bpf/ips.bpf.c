@@ -173,6 +173,29 @@ static __always_inline int is_malicious_tcp_flags(const struct tcphdr *tcp) {
            (tcp->fin && !tcp->ack);
 }
 
+// A packet that answers a conversation someone else started is not evidence that its sender is
+// compromised. Stage 0.5 quarantines a host that talks to a banned destination; without this
+// check, the VICTIM of a scan is quarantined for replying (RST / SYN-ACK / ICMP unreachable) to
+// the attacker it has just seen banned, and every unrelated flow of the victim is dropped with it
+// (measured 2026-11-12: a 941 Mb/s transfer to the scanned host fell to 0 for 300 s).
+// Returns 1 for: a TCP segment with ACK or RST set, an ICMP message that is not an Echo Request,
+// and a non-first IP fragment (no L4 header to judge). UDP cannot be told apart and returns 0.
+static __always_inline int is_reply_packet(const struct iphdr *ip, void *data_end) {
+    if ((bpf_ntohs(ip->frag_off) & 0x1FFF) != 0) return 1;
+    int hl = ip->ihl * 4;
+    if (hl < 20) return 0;
+    const __u8 *l4 = (const __u8 *)ip + hl;
+    if (ip->protocol == IPPROTO_TCP) {
+        if ((void *)(l4 + 14) > data_end) return 0;
+        return (l4[13] & 0x14) != 0;      // ACK (0x10) or RST (0x04)
+    }
+    if (ip->protocol == IPPROTO_ICMP) {
+        if ((void *)(l4 + 1) > data_end) return 0;
+        return l4[0] != 8;                // anything but Echo Request
+    }
+    return 0;
+}
+
 SEC("xdp")
 int ips_xdp_main(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
@@ -304,8 +327,12 @@ int ips_xdp_main(struct xdp_md *ctx) {
 
         struct ips_blocklist_data *dest_blocked = bpf_map_lookup_elem(&dynamic_bans_map, &dest_ip);
         if (dest_blocked) {
-            struct ips_quarantine_data q_val = { .quarantine_start_ns = bpf_ktime_get_ns() };
-            bpf_map_update_elem(&quarantine_map, &src_ip, &q_val, BPF_ANY);
+            // The packet is dropped either way (its destination is banned); only a packet that
+            // OPENS contact with a banned destination quarantines its sender.
+            if (!is_reply_packet(ip, data_end)) {
+                struct ips_quarantine_data q_val = { .quarantine_start_ns = bpf_ktime_get_ns() };
+                bpf_map_update_elem(&quarantine_map, &src_ip, &q_val, BPF_ANY);
+            }
             return XDP_DROP;
         }
     }
